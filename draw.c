@@ -52,9 +52,8 @@ static uint32_t blend(uint32_t bg, uint32_t fg, unsigned alpha)
 }
 
 static int layout(struct canvas c, int x, int baseline, int left, int right,
-                  int size, uint32_t color, const char *s)
+                  int size, uint32_t color, const char *s, size_t remaining)
 {
-	size_t remaining = strlen(s);
 	if (FT_Set_Pixel_Sizes(face, 0, size)) return 0;
 	while (remaining && (!c.pixels || x < right)) {
 		FcChar32 cp;
@@ -85,9 +84,50 @@ static int layout(struct canvas c, int x, int baseline, int left, int right,
 void text(struct canvas c, int x, int baseline, int left, int right,
           int size, uint32_t color, const char *s)
 {
-	layout(c, x, baseline, left, right, size, color, s);
+	layout(c, x, baseline, left, right, size, color, s, strlen(s));
 }
 int text_width(int size, const char *s)
 {
-	return layout((struct canvas){0}, 0, 0, 0, 0, size, 0, s);
+	return layout((struct canvas){0}, 0, 0, 0, 0, size, 0, s, strlen(s));
+}
+
+/* Measure a UTF-8 prefix in the current face. Always break between glyphs. */
+static size_t fit_prefix(const char *s, size_t len, int width)
+{
+	size_t pos = 0;
+	while (pos < len) {
+		FcChar32 cp;
+		int n = FcUtf8ToUcs4((const FcChar8 *)s + pos, &cp, len - pos > 4 ? 4 : (int)(len - pos));
+		if (n < 1) { cp = 0xfffd; n = 1; }
+		if (!FT_Load_Char(face, cp, FT_LOAD_NO_BITMAP)) width -= face->glyph->advance.x >> 6;
+		if (width < 0) break;
+		pos += n;
+	}
+	return pos;
+}
+
+void wrapped_title(struct canvas c, int x, int baseline, int width, int size,
+                   int lines, uint32_t color, const char *s)
+{
+	size_t len = strlen(s);
+	if (FT_Set_Pixel_Sizes(face, 0, size)) return;
+	for (int line = 0; line < lines && len; ++line) {
+		while (len && *s == ' ') { ++s; --len; }
+		size_t fit = fit_prefix(s, len, width), take = fit;
+		int ellipsis = fit < len && line == lines - 1;
+		if (ellipsis) {
+			take = fit_prefix(s, len, width - text_width(size, "…"));
+		} else if (fit < len && s[fit] != ' ') {
+			while (take && s[take - 1] != ' ') --take;
+			if (!take) take = fit;
+		}
+		size_t ink = take;
+		while (ink && s[ink - 1] == ' ') --ink;
+		int end = layout(c, x, baseline, x, x + width, size, color, s, ink);
+		if (ellipsis) text(c, end, baseline, x, x + width, size, color, "…");
+		if (!take || ellipsis) break;
+		s += take;
+		len -= take;
+		baseline += size + 3;
+	}
 }

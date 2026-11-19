@@ -29,7 +29,15 @@
 #error "Use a cover width of 2..4096 and spacing of 4..1024."
 #endif
 
-enum { CoverHeight = COVER_WIDTH * 3 / 2, Header = 52, Footer = FONT_SIZE + 6, Row = FONT_SIZE * 2 + 12, DialogHeight = FieldCount * Row + 8 };
+enum {
+	CoverHeight = COVER_WIDTH * 3 / 2,
+	TitleLines = 3,
+	TileHeight = CoverHeight + 6 + TitleLines * (FONT_SIZE + 3),
+	Header = HEADER_FONT_SIZE + 20,
+	Footer = STATUS_FONT_SIZE + 6,
+	Row = FONT_SIZE * 2 + 12,
+	DialogHeight = FieldCount * Row + 8
+};
 struct view {
 	struct wl_surface *surface;
 	struct xdg_surface *shell;
@@ -108,20 +116,20 @@ static int columns(void)
 static void paint(struct canvas c)
 {
 	int i, y, cols = columns(), width = c.width, height = c.height;
-	int rows = (height - Header - Footer - SPACING) / (CoverHeight + SPACING);
+	int rows = (height - Header - Footer - SPACING) / (TileHeight + SPACING);
 	int bar = height > Footer ? height - Footer : 0;
 	int right = width - 6;
-	int status_x = right - text_width(FONT_SIZE, status);
+	int status_x = right - text_width(STATUS_FONT_SIZE, status);
 	int split = status_x < width / 3 ? width / 3 : status_x;
 	if (rows < 1) rows = 1;
 	if (first_row > selected / cols) first_row = selected / cols;
 	if (first_row <= selected / cols - rows) first_row = selected / cols - rows + 1;
 	fill(c, 0, 0, width, height, BACKGROUND);
 	fill(c, 0, 0, width, Header, BAR_BACKGROUND);
-	text(c, SPACING, 34, 0, width, FONT_SIZE + 6, 0xffffff, "ludus");
+	text(c, SPACING, HEADER_FONT_SIZE + 6, 0, width, HEADER_FONT_SIZE, 0xffffff, "ludus");
 	for (i = first_row * cols; i < count; ++i) {
 		int left = SPACING + (i % cols) * (COVER_WIDTH + SPACING);
-		int top = Header + SPACING + (i / cols - first_row) * (CoverHeight + SPACING);
+		int top = Header + SPACING + (i / cols - first_row) * (TileHeight + SPACING);
 		int visible = width - left;
 		if (top >= bar) break;
 		if (visible <= 0) continue;
@@ -129,6 +137,8 @@ static void paint(struct canvas c)
 		if (i == selected)
 			fill(c, left - 2, top - 2, COVER_WIDTH + 4, CoverHeight + 4, BORDER_COLOR);
 		if (!games[i].tried) load_cover(&games[i]);
+		wrapped_title(c, left, top + CoverHeight + 6 + FONT_SIZE, COVER_WIDTH, FONT_SIZE,
+		              TitleLines, 0xffffff, games[i].value[Name]);
 		if (!games[i].thumbnail) {
 			fill(c, left, top, COVER_WIDTH, CoverHeight, 0x38393b);
 			continue;
@@ -138,10 +148,10 @@ static void paint(struct canvas c)
 			       games[i].thumbnail + y * COVER_WIDTH, visible * sizeof(*c.pixels));
 	}
 	fill(c, 0, bar, width, Footer, BAR_BACKGROUND);
-	text(c, 6, bar + FONT_SIZE + 1, 0, split - 4, FONT_SIZE, 0xffffff,
+	text(c, 6, bar + STATUS_FONT_SIZE + 1, 0, split - 4, STATUS_FONT_SIZE, 0xffffff,
 	     count ? games[selected].value[Name] : "+ Add game");
 	if (*status)
-		text(c, status_x, bar + FONT_SIZE + 1, split, right, FONT_SIZE, 0xffffff, status);
+		text(c, status_x, bar + STATUS_FONT_SIZE + 1, split, right, STATUS_FONT_SIZE, 0xffffff, status);
 
 }
 
@@ -241,7 +251,10 @@ static void save_form(void)
 		}
 	}
 	int result = library_save(editing, values);
-	if (result < 0) snprintf(form_error, sizeof form_error, "Save failed: %s", strerror(errno));
+	if (result < 0 && errno == EEXIST) {
+		field = Name;
+		strcpy(form_error, "A config with this name already exists.");
+	} else if (result < 0) snprintf(form_error, sizeof form_error, "Save failed: %s", strerror(errno));
 	else { selected = result; close_dialog(); }
 }
 
@@ -590,7 +603,7 @@ int main(int argc, char **argv)
 	if (!compositor || !shm || !wm) die("compositor lacks wl_compositor, wl_shm or xdg-shell");
 	create_view(&main_view, "ludus");
 	xdg_toplevel_set_min_size(main_view.window, COVER_WIDTH + 2 * SPACING,
-	                          Header + Footer + CoverHeight + 2 * SPACING);
+	                          Header + Footer + TileHeight + 2 * SPACING);
 	wl_surface_commit(main_view.surface);
 	event_loop();
 	wl_display_disconnect(display);

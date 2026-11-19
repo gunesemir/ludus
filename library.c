@@ -49,15 +49,64 @@ static int valid(char *const v[FieldCount])
 	       (!*v[Prefix] || v[Prefix][0] == '/') && (!*v[Proton] || v[Proton][0] == '/');
 }
 
-static void read_game(const char *entry)
+/* Keep titles readable while encoding filename separators and literal escapes. */
+static int game_path(char *dest, const char *name)
 {
-	char path[PATH_MAX], *values[FieldCount] = {0};
-	FILE *f;
-	int i;
-	if (join(path, dir, entry) || !(f = fopen(path, "r"))) {
-		perror(entry);
-		return;
+	char file[NAME_MAX + 1];
+	size_t n = 0;
+	for (const char *p = name; *p; ++p) {
+		const char *escape = NULL;
+		if (*p == '/') escape = "%2F";
+		if (*p == '%') escape = "%25";
+		if (p == name && *p == '.') escape = "%2E";
+		size_t bytes = escape ? 3 : 1;
+		if (n + bytes + sizeof ".conf" > sizeof file) { errno = ENAMETOOLONG; return -1; }
+		if (escape) memcpy(file + n, escape, bytes);
+		else file[n] = *p;
+		n += bytes;
 	}
+	strcpy(file + n, ".conf");
+	return join(dest, dir, file);
+}
+
+/* Publish before retiring the old name, including across filesystems. */
+static int write_game(const char *dest, const char *existing, char *const values[FieldCount])
+{
+	char temp[PATH_MAX];
+	int fd, error = 0;
+	FILE *f;
+	if (mkdir(dir, 0700) && errno != EEXIST) return -1;
+	if (join(temp, dir, ".new-XXXXXX")) return -1;
+	fd = mkstemp(temp);
+	if (fd < 0) return -1;
+	f = fdopen(fd, "w");
+	if (!f) { error = errno; close(fd); }
+	else {
+		for (int i = 0; i < FieldCount; ++i)
+			if (fprintf(f, "%s\n", values[i]) < 0) { error = errno; break; }
+		if (fclose(f)) error = errno;
+	}
+	if (!error && existing && !strcmp(existing, dest)) {
+		if (!rename(temp, dest)) return 0;
+		error = errno;
+	} else if (!error) {
+		if (link(temp, dest)) error = errno;
+		else if (existing && unlink(existing)) {
+			error = errno;
+			unlink(dest);
+		}
+	}
+	unlink(temp);
+	if (error) { errno = error; return -1; }
+	return 0;
+}
+
+static void read_game(const char *path, int legacy)
+{
+	char dest[PATH_MAX], *values[FieldCount] = {0};
+	FILE *f = fopen(path, "r");
+	int i;
+	if (!f) { perror(path); return; }
 	for (i = 0; i < FieldCount; ++i) {
 		size_t cap = 0;
 		ssize_t n = getline(&values[i], &cap, f);
@@ -73,75 +122,55 @@ static void read_game(const char *entry)
 	}
 	if (i == FieldCount && valid(values)) {
 		int index = library_append(values);
+		if (legacy) {
+			if (game_path(dest, values[Name]) || write_game(dest, path, values))
+				fprintf(stderr, "ludus: could not move %s: %s\n", path, strerror(errno));
+			else path = dest;
+		}
 		games[index].path = copy(path);
 	} else fprintf(stderr, "ludus: invalid entry: %s\n", path);
 	fclose(f);
 	for (i = 0; i < FieldCount; ++i) free(values[i]);
 }
 
-void library_load(void)
+static void scan_games(const char *directory, int legacy)
 {
-	const char *base = getenv("XDG_DATA_HOME");
-	char fallback[PATH_MAX];
 	struct dirent **entries;
-	int n;
-	if (!base || *base != '/') {
-		base = getenv("HOME");
-		if (!base || *base != '/' || join(fallback, base, ".local/share")) return;
-		base = fallback;
-	}
-	if (join(dir, base, "ludus/games")) { dir[0] = 0; return; }
-	n = scandir(dir, &entries, NULL, alphasort);
-	if (n < 0) { if (errno != ENOENT) perror(dir); return; }
+	int n = scandir(directory, &entries, NULL, alphasort);
+	if (n < 0) { if (errno != ENOENT) perror(directory); return; }
 	for (int i = 0; i < n; ++i) {
-		if (!strncmp(entries[i]->d_name, "game-", 5)) read_game(entries[i]->d_name);
+		char path[PATH_MAX];
+		const char *name = entries[i]->d_name;
+		size_t len = strlen(name);
+		int match = legacy ? !strncmp(name, "game-", 5) : len > 5 && !strcmp(name + len - 5, ".conf");
+		if (match && !join(path, directory, name)) {
+			struct stat st;
+			if (!lstat(path, &st) && S_ISREG(st.st_mode)) read_game(path, legacy);
+		}
 		free(entries[i]);
 	}
 	free(entries);
 }
 
-static int create_dirs(void)
+void library_load(void)
 {
-	char path[PATH_MAX];
-	strcpy(path, dir);
-	for (char *p = path + 1;; ++p) {
-		int end = !*p;
-		if (!end && *p != '/') continue;
-		*p = 0;
-		if (mkdir(path, 0700) && errno != EEXIST) return -1;
-		if (end) return 0;
-		*p = '/';
-	}
+	const char *home = getenv("HOME"), *base = getenv("XDG_DATA_HOME");
+	char legacy[PATH_MAX];
+	if (!home || *home != '/' || join(dir, home, ".ludus")) { dir[0] = 0; return; }
+	scan_games(dir, 0);
+	if (base && *base == '/') {
+		if (join(legacy, base, "ludus/games")) return;
+	} else if (join(legacy, home, ".local/share/ludus/games")) return;
+	scan_games(legacy, 1);
 }
 
-/* Write the whole record before publishing it or replacing an existing one. */
 int library_save(int index, char *const values[FieldCount])
 {
-	char temp[PATH_MAX], dest[PATH_MAX];
-	int fd, error = 0;
-	FILE *f;
+	char dest[PATH_MAX];
+	const char *existing = index >= 0 ? games[index].path : NULL;
 	if (!valid(values)) { errno = EINVAL; return -1; }
 	if (!*dir) { errno = ENOENT; return -1; }
-	if (create_dirs() || join(temp, dir, ".new-XXXXXX")) return -1;
-	fd = mkstemp(temp);
-	if (fd < 0) return -1;
-	f = fdopen(fd, "w");
-	if (!f) { error = errno; close(fd); }
-	else {
-		for (int i = 0; i < FieldCount; ++i)
-			if (fprintf(f, "%s\n", values[i]) < 0) { error = errno; break; }
-		if (fclose(f)) error = errno;
-	}
-	const char *existing = index >= 0 ? games[index].path : NULL;
-	if (!error && existing) {
-		if (rename(temp, existing)) error = errno;
-	} else if (!error) {
-		strcpy(dest, temp);
-		memcpy(strrchr(dest, '/') + 1, "game-", 5);
-		if (link(temp, dest)) error = errno;
-	}
-	if (!existing || error) unlink(temp);
-	if (error) { errno = error; return -1; }
+	if (game_path(dest, values[Name]) || write_game(dest, existing, values)) return -1;
 	if (index < 0) {
 		index = library_append(values);
 	} else {
@@ -157,7 +186,8 @@ int library_save(int index, char *const values[FieldCount])
 		}
 		g->command = NULL;
 	}
-	if (!existing) games[index].path = copy(dest);
+	free(games[index].path);
+	games[index].path = copy(dest);
 	return index;
 }
 

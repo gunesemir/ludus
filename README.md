@@ -15,6 +15,10 @@ Fontconfig resolves `FONT_PATTERN` to an installed font. The default is
 `"DejaVu Sans:style=Book"`. Use `fc-match 'Hack,monospace'` to see which
 font your system selects.
 
+The default grid uses 216×324 covers with up to three lines of title below each
+one. Longer titles end with an ellipsis. The selection bar shows the full name
+when it fits. The header defaults to 32 px and the status bar to 16 px.
+
 ## Add or edit a game
 
 Press `+` to add a game or `e` to edit the selected game. Enter saves the
@@ -34,8 +38,20 @@ For example, `exec "$@" -novid` adds a game option and
 `exec gamemoderun "$@"` wraps the launch. You can also leave the executable
 and runner empty and enter a complete command such as `exec steam -applaunch 620`.
 
-Games are saved individually under `$XDG_DATA_HOME/ludus/games/`, which
-defaults to `~/.local/share/ludus/games/`. The bottom bar follows the
+Each game has a plain-text file named after its title, such as
+`~/.ludus/Black Mesa.conf`. Renaming the game in the editor renames its file.
+Titles must have distinct filenames. Spaces and Unicode are preserved. In
+filenames, `/`, `%`, and a leading dot are encoded as `%2F`, `%25`, and `%2E`.
+
+On startup, Ludus moves valid entries from the previous
+`$XDG_DATA_HOME/ludus/games/` directory (default `~/.local/share/ludus/games/`).
+If a destination already exists, the old entry stays available under its old
+path. Give that entry a distinct title with `e` to finish moving it.
+
+The seven lines in a config file are the name, executable, artwork, runner,
+WINEPREFIX, PROTONPATH, and launch command, in that order. Keep a blank line
+for each unused field.
+The bottom bar follows the
 launched process: it shows “Playing” at launch and “Stopped” when that
 process exits. A runner that detaches from its game can exit earlier.
 

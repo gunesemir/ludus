@@ -3,7 +3,7 @@
 #define SPACING            16
 
 /* Fontconfig family and pixel sizes. */
-#define FONT_PATTERN      "Hack,monospace"
+#define FONT_PATTERN      "monospace"
 #define HEADER_FONT_SIZE   32
 #define STATUS_FONT_SIZE   16
 #define FONT_SIZE          16  /* Game titles and form fields */

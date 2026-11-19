@@ -54,7 +54,7 @@ static size_t query_cursor;
 static enum field field;
 static size_t cursor[FieldCount];
 static int editing;
-static const char *labels[] = {"Name", "Executable", "Artwork", "Runner", "WINEPREFIX", "PROTONPATH", "Launch command"};
+static const char *labels[] = {"Name", "Executable", "Working directory", "Artwork", "Runner", "Prefix", "Wine/Proton version", "Launch command"};
 static void open_dialog(int index);
 static void close_dialog(void);
 static struct wl_display *display;
@@ -396,7 +396,9 @@ static void press(xkb_keysym_t sym)
 		if (error == EALREADY || !error)
 			snprintf(status, sizeof status, "Playing %s", g->value[Name]);
 		else {
-			if (program && *program)
+			if (program && *program && *g->value[Workdir])
+				snprintf(status, sizeof status, "Cannot start %s in %s: %s", program, g->value[Workdir], strerror(error));
+			else if (program && *program)
 				snprintf(status, sizeof status, "Cannot start %s: %s", program, strerror(error));
 			else
 				snprintf(status, sizeof status, "No launch command or executable configured");

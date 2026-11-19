@@ -3,7 +3,7 @@
 #include <stdint.h>
 #include <sys/types.h>
 
-enum field { Name, Exe, Art, Runner, Prefix, Proton, Launch, FieldCount };
+enum field { Name, Exe, Workdir, Art, Runner, Prefix, Proton, Launch, FieldCount };
 struct game {
 	char *value[FieldCount];
 	char *path; /* File backing a saved entry */

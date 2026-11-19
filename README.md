@@ -35,14 +35,36 @@ matches, wrapping around the library.
 Enter a name. Artwork is optional and takes an absolute JPEG or PNG path. For a direct launch,
 enter the game's absolute executable path. The runner starts blank. Set it
 to a program on PATH or an absolute path to run the executable with that
-program, for example `wine`, `umu-run`, or `/bin/sh`. Set WINEPREFIX or
-PROTONPATH to pass those environment variables to the game.
+program, for example `wine`, `umu-run`, or `/bin/sh`.
+
+**Working directory** (`workdir`) takes an absolute directory path. Ludus starts
+the runner, wrappers, and launch command in that directory, so relative game
+assets and arguments resolve there. Leave it empty to inherit Ludus's directory.
+
+**Prefix** sets `WINEPREFIX`. **Wine/Proton version** sets `PROTONPATH` for
+runners such as umu-run, which accepts a Proton path or version name. To
+select a particular standalone Wine build, put its Wine binary in **Runner**.
 
 The optional **Launch command** runs through `/bin/sh -c`. Use `"$@"` to
 insert the configured runner (if present) and executable as separate arguments.
 For example, `exec "$@" -novid` adds a game option and
 `exec gamemoderun "$@"` wraps the launch. You can also leave the executable
 and runner empty and enter a complete command such as `exec steam -applaunch 620`.
+
+Examples for the `cmd` field (one per game):
+
+```ini
+cmd=GAMEID=umu-starcitizen STORE=gog UMU_LOG=debug exec "$@"
+cmd=WINEDLLOVERRIDES="dinput8=n,b" WINEDEBUG=+loaddll exec "$@" -novid
+cmd=exec mangohud "$@"
+cmd=exec gamescope -f -- "$@" -novid
+cmd=exec gamescope --mangoapp -f -- "$@"
+cmd=exec umu-run --config "./game settings.toml"
+```
+
+The last example supplies a complete command and uses `workdir` to resolve
+the relative TOML path. Install the tools used by your command. For the
+Gamescope overlay example, install mangoapp as well.
 
 Each game has a plain-text file named after its title, such as
 `~/.ludus/Black Mesa.meta`. Renaming the game in the editor renames its file.
@@ -53,22 +75,18 @@ Metadata is UTF-8 with one `key=value` per line, in any order. Start a line
 with `#` for a comment. Values are literal text, including spaces and any
 additional equals signs. Only `cmd` is interpreted by a shell at launch.
 Specify `name` and either `exe` or `cmd`. Other keys can be blank or omitted.
-Here is an example using all seven keys:
+Here is an example using all eight keys:
 
 ```ini
 name=Black Mesa
 exe=/games/Black Mesa/bms.exe
+workdir=/games/Black Mesa
 art=/pictures/Black Mesa.jpg
 runner=umu-run
 WINEPREFIX=/games/prefixes/black-mesa
 PROTONPATH=GE-Proton
 cmd=
 ```
-
-Ludus migrates positional `.conf` files in `~/.ludus/` and old `game-*`
-entries in `$XDG_DATA_HOME/ludus/games/` (default `~/.local/share/ludus/games/`).
-If a destination already exists, the old entry stays available at its original
-path. Give it a distinct title with `e` to finish moving it.
 
 The bottom bar follows the
 launched process: it shows “Playing” at launch and “Stopped” when that

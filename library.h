@@ -17,5 +17,5 @@ extern int count;
 int library_append(char *const values[FieldCount]);
 void library_load(void);
 int library_save(int index, char *const values[FieldCount]);
-int game_launch(struct game *g);
+int game_launch(struct game *g, const char **program);
 #endif

@@ -327,11 +327,17 @@ static void press(xkb_keysym_t sym)
 	}
 	if (sym == KEY_LAUNCH) {
 		struct game *g = &games[selected];
-		int error = game_launch(g);
+		const char *program;
+		int error = game_launch(g, &program);
 		if (error == EALREADY || !error)
 			snprintf(status, sizeof status, "Playing %s", g->value[Name]);
-		else
-			snprintf(status, sizeof status, "%s: %s", g->value[Name], strerror(error));
+		else {
+			if (program && *program)
+				snprintf(status, sizeof status, "Cannot start %s: %s", program, strerror(error));
+			else
+				snprintf(status, sizeof status, "No launch command or executable configured");
+			fprintf(stderr, "ludus: %s: %s\n", g->value[Name], status);
+		}
 		if (!error) ++active;
 		main_view.dirty = 1;
 	}

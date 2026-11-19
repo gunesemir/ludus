@@ -161,7 +161,7 @@ int library_save(int index, char *const values[FieldCount])
 	return index;
 }
 
-int game_launch(struct game *g)
+int game_launch(struct game *g, const char **program)
 {
 	char *launch[7], **args = launch;
 	size_t argc = 0;
@@ -181,6 +181,7 @@ int game_launch(struct game *g)
 	size_t i, n = 0;
 	int error;
 	pid_t pid;
+	*program = args[0];
 	if (g->pid) return EALREADY;
 	if (!args[0] || !*args[0]) return ENOEXEC;
 	if (snprintf(prefix_env, sizeof prefix_env, "WINEPREFIX=%s", prefix) >= (int)sizeof prefix_env ||

@@ -9,3 +9,10 @@
 #define KEY_RIGHT  XKB_KEY_l
 #define KEY_LAUNCH XKB_KEY_Return
 #define KEY_QUIT   XKB_KEY_q
+
+#define FONT_PATTERN "Hack,monospace"
+#define FONT_SIZE 16
+#define BACKGROUND 0x000000
+#define HEADER_BACKGROUND 0x888888
+#define BAR_BACKGROUND 0x222222
+#define KEY_ADD XKB_KEY_plus

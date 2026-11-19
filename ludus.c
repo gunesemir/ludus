@@ -1,9 +1,8 @@
 #define _POSIX_C_SOURCE 200809L
 #include <errno.h>
-#include <fcntl.h>
 #include <limits.h>
-#include <signal.h>
-#include <spawn.h>
+#include <poll.h>
+#include <sys/wait.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -15,6 +14,8 @@
 #include <xkbcommon/xkbcommon.h>
 #include "xdg-shell-client-protocol.h"
 #include "config.h"
+#include "draw.h"
+#include "library.h"
 
 #define STBI_ONLY_PNG
 #define STBI_ONLY_JPEG
@@ -28,32 +29,36 @@
 #error "Use a cover width of 2..4096 and spacing of 4..1024."
 #endif
 
-enum { CoverHeight = COVER_WIDTH * 3 / 2, Header = 52 };
-struct game {
-	const char *cover;
-	char **command;
-	uint32_t *thumbnail;
-	int tried;
+enum { CoverHeight = COVER_WIDTH * 3 / 2, Header = 52, Footer = 36 };
+struct view {
+	struct wl_surface *surface;
+	struct xdg_surface *shell;
+	struct xdg_toplevel *window;
+	int width, height, configured, dirty, busy;
 };
 struct frame {
 	struct wl_buffer *buffer;
 	uint32_t *pixels;
 	size_t bytes;
+	struct view *owner;
 };
-static struct game *games;
-static int count, selected, first_row;
-static int width = 900, height = 640, configured, running = 1, dirty = 1, busy;
+static struct view main_view = { .width = 900, .height = 640 }, dialog;
+static struct wl_surface *focus;
+static int selected, first_row, running = 1, active;
+static char fields[FieldCount][PATH_MAX], form_error[256], status[PATH_MAX + 128];
+static enum field field;
+static const char *labels[] = {"Name", "Executable", "Artwork", "Runner", "WINEPREFIX", "PROTONPATH"};
+static void open_dialog(void);
+static void close_dialog(void);
 static struct wl_display *display;
 static struct wl_compositor *compositor;
 static struct wl_shm *shm;
 static struct wl_seat *seat;
 static uint32_t seat_name;
 static struct wl_keyboard *keyboard;
-static struct wl_surface *surface;
 static struct xdg_wm_base *wm;
 static struct xkb_context *xkb;
 static struct xkb_state *keys;
-extern char **environ;
 
 static void die(const char *message)
 {
@@ -67,9 +72,9 @@ static void load_cover(struct game *g)
 	int w, h, channels, sw, sh, x, y;
 	unsigned char *src;
 	g->tried = 1;
-	src = stbi_load(g->cover, &w, &h, &channels, 3);
+	src = stbi_load(g->value[Art], &w, &h, &channels, 3);
 	if (!src) {
-		fprintf(stderr, "ludus: %s: %s\n", g->cover, stbi_failure_reason());
+		fprintf(stderr, "ludus: %s: %s\n", g->value[Art], stbi_failure_reason());
 		return;
 	}
 	g->thumbnail = malloc((size_t)COVER_WIDTH * CoverHeight * sizeof(uint32_t));
@@ -92,57 +97,72 @@ static void load_cover(struct game *g)
 	stbi_image_free(src);
 }
 
-static void rect(uint32_t *pixels, int x, int y, int w, int h, uint32_t color)
-{
-	int i, j;
-	for (j = y; j < y + h && j < height; ++j)
-		for (i = x; i < x + w && i < width; ++i)
-			pixels[(size_t)j * width + i] = color;
-}
-
 static int columns(void)
 {
-	int n = (width - SPACING) / (COVER_WIDTH + SPACING);
+	int n = (main_view.width - SPACING) / (COVER_WIDTH + SPACING);
 	return n > 0 ? n : 1;
 }
 
-static void paint(uint32_t *pixels)
+static void paint(struct canvas c)
 {
-	/* Five lowercase bitmap glyphs spell the fixed wordmark. */
-	static const unsigned char logo[5][7] = {
-		{12,4,4,4,4,4,14}, {0,0,17,17,17,19,13}, {1,1,13,19,17,19,13},
-		{0,0,17,17,17,19,13}, {0,0,15,16,14,1,30}
-	};
-	int i, x, y, cols = columns();
-	int rows = (height - Header - SPACING) / (CoverHeight + SPACING);
+	int i, y, cols = columns(), width = c.width, height = c.height;
+	int rows = (height - Header - Footer - SPACING) / (CoverHeight + SPACING);
+	int bar = height > Footer ? height - Footer : 0;
+	int split = *status ? width / 2 : width;
 	if (rows < 1) rows = 1;
 	if (first_row > selected / cols) first_row = selected / cols;
 	if (first_row <= selected / cols - rows) first_row = selected / cols - rows + 1;
-	rect(pixels, 0, 0, width, height, 0x161719);
-	for (i = 0; i < 5; ++i)
-		for (y = 0; y < 7; ++y)
-			for (x = 0; x < 5; ++x)
-				if (logo[i][y] & (16 >> x))
-					rect(pixels, SPACING + i * 18 + x * 3, 16 + y * 3, 3, 3, 0xf0ece5);
-	rect(pixels, 0, Header - 1, width, 1, 0x37383a);
+	fill(c, 0, 0, width, height, BACKGROUND);
+	fill(c, 0, 0, width, Header, HEADER_BACKGROUND);
+	text(c, SPACING, 34, 0, width, FONT_SIZE + 6, 0, "ludus");
 	for (i = first_row * cols; i < count; ++i) {
 		int left = SPACING + (i % cols) * (COVER_WIDTH + SPACING);
 		int top = Header + SPACING + (i / cols - first_row) * (CoverHeight + SPACING);
 		int visible = width - left;
-		if (top >= height) break;
+		if (top >= bar) break;
 		if (visible <= 0) continue;
 		if (visible > COVER_WIDTH) visible = COVER_WIDTH;
 		if (i == selected)
-			rect(pixels, left - 2, top - 2, COVER_WIDTH + 4, CoverHeight + 4, BORDER_COLOR);
+			fill(c, left - 2, top - 2, COVER_WIDTH + 4, CoverHeight + 4, BORDER_COLOR);
 		if (!games[i].tried) load_cover(&games[i]);
 		if (!games[i].thumbnail) {
-			rect(pixels, left, top, COVER_WIDTH, CoverHeight, 0x38393b);
+			fill(c, left, top, COVER_WIDTH, CoverHeight, 0x38393b);
 			continue;
 		}
-		for (y = 0; y < CoverHeight && top + y < height; ++y)
-			memcpy(pixels + (size_t)(top + y) * width + left,
-			       games[i].thumbnail + y * COVER_WIDTH, visible * sizeof(*pixels));
+		for (y = 0; y < CoverHeight && top + y < bar; ++y)
+			memcpy(c.pixels + (size_t)(top + y) * width + left,
+			       games[i].thumbnail + y * COVER_WIDTH, visible * sizeof(*c.pixels));
 	}
+	fill(c, 0, bar, width, Footer, BAR_BACKGROUND);
+	text(c, SPACING, bar + 24, 0, split - 4, FONT_SIZE, 0xffffff,
+	     count ? games[selected].value[Name] : "+ Add game");
+	if (*status)
+		text(c, split, bar + 24, split, width - 4, FONT_SIZE, 0xffffff, status);
+
+}
+
+static void paint_dialog(struct canvas c)
+{
+	int left = 14, right = c.width - 14;
+	int step = (c.height - 82) / FieldCount;
+	if (step < 1) step = 1;
+	fill(c, 0, 0, c.width, c.height, BAR_BACKGROUND);
+	for (int i = 0; i < FieldCount; ++i) {
+		int y = 6 + i * step, start = left + 5;
+		int available = right - start - 5;
+		int used = text_width(FONT_SIZE, fields[i]);
+		fill(c, left, y + 20, right - left, step - 22, i == (int)field ? BORDER_COLOR : 0x555555);
+		fill(c, left + 1, y + 21, right - left - 2, step - 24, 0);
+		text(c, left, y + 15, left, right, FONT_SIZE, 0xffffff, labels[i]);
+		if (i == (int)field && used > available) start -= used - available;
+		text(c, start, y + 40, left + 4, right - 2, FONT_SIZE, 0xffffff, fields[i]);
+		if (i == (int)field)
+			fill(c, start + used + 1, y + 25, 1, 17, BORDER_COLOR);
+	}
+	text(c, left, c.height - 48, left, right, FONT_SIZE, BORDER_COLOR, form_error);
+	text(c, left, c.height - 26, left, right, FONT_SIZE, 0xffffff, "Tab: next   Enter: save   Esc: cancel");
+	if (field == Runner)
+		text(c, left, c.height - 7, left, right, FONT_SIZE, 0xffffff, "Left / Right: choose runner");
 }
 
 static void released(void *data, struct wl_buffer *buffer)
@@ -150,22 +170,24 @@ static void released(void *data, struct wl_buffer *buffer)
 	struct frame *frame = data;
 	wl_buffer_destroy(buffer);
 	munmap(frame->pixels, frame->bytes);
+	--frame->owner->busy;
 	free(frame);
-	--busy;
 }
 static const struct wl_buffer_listener buffer_events = { .release = released };
 
-static void redraw(void)
+static void redraw(struct view *v)
 {
 	char path[] = "/tmp/ludus-XXXXXX";
 	struct frame *frame;
 	struct wl_shm_pool *pool;
 	int fd;
-	if (!configured || !dirty || busy >= 2) return;
+	int width = v->width, height = v->height;
+	if (!v->configured || !v->dirty || v->busy >= 2) return;
 	if ((int64_t)width * height > INT32_MAX / 4)
 		die("window too large for a Wayland shared memory buffer");
 	frame = calloc(1, sizeof(*frame));
 	if (!frame) die("out of memory");
+	frame->owner = v;
 	frame->bytes = (size_t)width * height * 4;
 	fd = mkstemp(path);
 	if (fd < 0) die(strerror(errno));
@@ -179,18 +201,83 @@ static void redraw(void)
 	wl_shm_pool_destroy(pool);
 	close(fd);
 	wl_buffer_add_listener(frame->buffer, &buffer_events, frame);
-	paint(frame->pixels);
-	wl_surface_attach(surface, frame->buffer, 0, 0);
-	wl_surface_damage(surface, 0, 0, width, height);
-	wl_surface_commit(surface);
-	++busy;
-	dirty = 0;
+	struct canvas c = {frame->pixels, width, height};
+	if (v == &dialog) paint_dialog(c);
+	else paint(c);
+	wl_surface_attach(v->surface, frame->buffer, 0, 0);
+	wl_surface_damage(v->surface, 0, 0, width, height);
+	wl_surface_commit(v->surface);
+	++v->busy;
+	v->dirty = 0;
+}
+
+static void form_key(xkb_keysym_t sym, uint32_t code)
+{
+	char *value = fields[field];
+	size_t len = strlen(value);
+	char typed[64];
+	int n;
+	dialog.dirty = 1;
+	if (sym == XKB_KEY_Escape) { close_dialog(); return; }
+	form_error[0] = 0;
+	if (sym == XKB_KEY_Tab) field = (field + 1) % FieldCount;
+	else if (sym == XKB_KEY_ISO_Left_Tab) field = (field + FieldCount - 1) % FieldCount;
+	else if (sym == XKB_KEY_Return || sym == XKB_KEY_KP_Enter) {
+		char *values[FieldCount];
+		for (int i = 0; i < FieldCount; ++i) values[i] = fields[i];
+		if (!*fields[Name]) {
+			strcpy(form_error, "Enter a name.");
+			field = Name;
+			return;
+		}
+		for (int i = Exe; i < FieldCount; ++i) {
+			if (i == Runner || (i >= Prefix && !*fields[i])) continue;
+			if (*fields[i] != '/') {
+				snprintf(form_error, sizeof form_error, "%s needs an absolute path.", labels[i]);
+				field = i;
+				return;
+			}
+		}
+		int added = library_save(values);
+		if (added < 0) snprintf(form_error, sizeof form_error, "Save failed: %s", strerror(errno));
+		else { selected = added; close_dialog(); }
+	} else if (field == Runner) {
+		if (sym == XKB_KEY_space || sym == XKB_KEY_Left || sym == XKB_KEY_Right)
+			strcpy(value, !strcmp(value, "wine") ? "umu-run" : "wine");
+	} else if (sym == XKB_KEY_BackSpace && len) {
+		do { --len; } while (len && ((unsigned char)value[len] & 0xc0) == 0x80);
+		value[len] = 0;
+	} else {
+		n = xkb_state_key_get_utf8(keys, code, typed, sizeof typed);
+		if (n > 0 && n < (int)sizeof typed && len + n < PATH_MAX &&
+		    (unsigned char)typed[0] >= 32 && typed[0] != 127)
+			memcpy(value + len, typed, n + 1);
+	}
+}
+
+static void reap(void)
+{
+	int result;
+	pid_t pid;
+	while ((pid = waitpid(-1, &result, WNOHANG)) > 0) {
+		for (int i = 0; i < count; ++i) {
+			if (games[i].pid != pid) continue;
+			games[i].pid = 0;
+			--active;
+			snprintf(status, sizeof status, "Stopped %s", games[i].value[Name]);
+			if (WIFEXITED(result) && WEXITSTATUS(result))
+				snprintf(status, sizeof status, "Stopped %s (exit %d)", games[i].value[Name], WEXITSTATUS(result));
+			main_view.dirty = 1;
+			break;
+		}
+	}
 }
 
 static void press(xkb_keysym_t sym)
 {
 	int col = columns(), old = selected;
 	if (sym == KEY_QUIT) running = 0;
+	if (sym == KEY_ADD || sym == XKB_KEY_KP_Add) { open_dialog(); return; }
 	if (!count) return;
 	if (sym == KEY_LEFT && selected % col > 0) --selected;
 	if (sym == KEY_RIGHT && selected % col < col - 1 && selected + 1 < count) ++selected;
@@ -199,13 +286,17 @@ static void press(xkb_keysym_t sym)
 		selected += col;
 		if (selected >= count) selected = count - 1;
 	}
-	if (sym == KEY_LAUNCH && games[selected].command) {
-		char **argv = games[selected].command;
-		pid_t pid;
-		int error = posix_spawnp(&pid, argv[0], NULL, NULL, argv, environ);
-		if (error) fprintf(stderr, "ludus: %s: %s\n", argv[0], strerror(error));
+	if (sym == KEY_LAUNCH) {
+		struct game *g = &games[selected];
+		int error = game_launch(g);
+		if (error == EALREADY || !error)
+			snprintf(status, sizeof status, "Playing %s", g->value[Name]);
+		else
+			snprintf(status, sizeof status, "%s: %s", g->value[Name], strerror(error));
+		if (!error) ++active;
+		main_view.dirty = 1;
 	}
-	if (selected != old) dirty = 1;
+	if (selected != old) main_view.dirty = 1;
 }
 
 static void keymap(void *data, struct wl_keyboard *kb, uint32_t format, int fd, uint32_t size)
@@ -238,13 +329,16 @@ static void key(void *data, struct wl_keyboard *kb, uint32_t serial, uint32_t ti
                 uint32_t code, uint32_t state)
 {
 	(void)data; (void)kb; (void)serial; (void)time;
-	if (keys && state == WL_KEYBOARD_KEY_STATE_PRESSED)
-		press(xkb_state_key_get_one_sym(keys, code + 8));
+	if (!keys || state != WL_KEYBOARD_KEY_STATE_PRESSED) return;
+	xkb_keysym_t sym = xkb_state_key_get_one_sym(keys, code + 8);
+	if (dialog.surface) {
+		if (focus == dialog.surface) form_key(sym, code + 8);
+	} else if (focus == main_view.surface) press(sym);
 }
 static void enter(void *d, struct wl_keyboard *k, uint32_t s, struct wl_surface *w, struct wl_array *a)
-{ (void)d; (void)k; (void)s; (void)w; (void)a; }
+{ (void)d; (void)k; (void)s; focus = w; (void)a; }
 static void leave(void *d, struct wl_keyboard *k, uint32_t s, struct wl_surface *w)
-{ (void)d; (void)k; (void)s; (void)w; }
+{ (void)d; (void)k; (void)s; if (focus == w) focus = NULL; }
 static const struct wl_keyboard_listener keyboard_events = {
 	.keymap = keymap, .enter = enter, .leave = leave, .key = key, .modifiers = modifiers
 };
@@ -295,46 +389,105 @@ static const struct wl_registry_listener registry_events = { .global = global, .
 
 static void configure(void *data, struct xdg_surface *s, uint32_t serial)
 {
-	(void)data;
+	struct view *v = data;
 	xdg_surface_ack_configure(s, serial);
-	configured = dirty = 1;
+	v->configured = v->dirty = 1;
 }
 static const struct xdg_surface_listener surface_events = { .configure = configure };
 
 static void resize(void *data, struct xdg_toplevel *t, int32_t w, int32_t h, struct wl_array *states)
 {
-	(void)data; (void)t; (void)states;
-	if (w > 0) width = w;
-	if (h > 0) height = h;
+	struct view *v = data;
+	(void)t; (void)states;
+	if (w > 0) v->width = w;
+	if (h > 0) v->height = h;
 }
 static void closed(void *data, struct xdg_toplevel *t)
-{ (void)data; (void)t; running = 0; }
+{ (void)t; if (data == &dialog) close_dialog(); else running = 0; }
 static const struct xdg_toplevel_listener window_events = { .configure = resize, .close = closed };
+
+static void create_view(struct view *v, const char *title)
+{
+	v->surface = wl_compositor_create_surface(compositor);
+	v->shell = xdg_wm_base_get_xdg_surface(wm, v->surface);
+	xdg_surface_add_listener(v->shell, &surface_events, v);
+	v->window = xdg_surface_get_toplevel(v->shell);
+	xdg_toplevel_add_listener(v->window, &window_events, v);
+	xdg_toplevel_set_title(v->window, title);
+	xdg_toplevel_set_app_id(v->window, "ludus");
+}
+
+static void open_dialog(void)
+{
+	memset(fields, 0, sizeof fields);
+	strcpy(fields[Runner], "wine");
+	field = Name;
+	form_error[0] = 0;
+	dialog.width = 520;
+	dialog.height = 400;
+	create_view(&dialog, "Add game");
+	xdg_toplevel_set_parent(dialog.window, main_view.window);
+	xdg_toplevel_set_min_size(dialog.window, 420, 380);
+	xdg_toplevel_set_max_size(dialog.window, 520, 400);
+	wl_surface_commit(dialog.surface);
+}
+
+static void close_dialog(void)
+{
+	if (focus == dialog.surface) focus = NULL;
+	xdg_toplevel_destroy(dialog.window);
+	xdg_surface_destroy(dialog.shell);
+	wl_surface_destroy(dialog.surface);
+	dialog.surface = NULL;
+	dialog.configured = 0;
+	main_view.dirty = 1;
+}
+
+static void event_loop(void)
+{
+	struct pollfd fd = { .fd = wl_display_get_fd(display) };
+	while (running) {
+		if (wl_display_dispatch_pending(display) < 0) die("Wayland connection lost");
+		if (!running) break;
+		if (active) reap();
+		redraw(&main_view);
+		redraw(&dialog);
+		fd.events = POLLIN;
+		if (wl_display_flush(display) < 0) {
+			if (errno != EAGAIN) die("Wayland connection lost");
+			fd.events |= POLLOUT;
+		}
+		if (poll(&fd, 1, active ? 150 : -1) < 0) {
+			if (errno == EINTR) continue;
+			die(strerror(errno));
+		}
+		if (fd.revents & (POLLERR | POLLHUP | POLLNVAL)) die("Wayland connection lost");
+		if ((fd.revents & POLLIN) && wl_display_dispatch(display) < 0) die("Wayland connection lost");
+	}
+}
 
 int main(int argc, char **argv)
 {
 	struct wl_registry *registry;
-	struct xdg_surface *shell_surface;
-	struct xdg_toplevel *window;
-	struct sigaction action = {0};
 	int i;
-	games = calloc(argc, sizeof(*games));
-	if (!games) die("out of memory");
+	font_init(FONT_PATTERN);
+	library_load();
 	for (i = 1; i < argc;) {
+		char *values[FieldCount] = {0};
 		if (!strcmp(argv[i], "--")) die("expected a cover path before --");
-		games[count].cover = argv[i++];
-		if (i < argc && strcmp(argv[i], "--")) games[count].command = argv + i;
+		values[Art] = argv[i++];
+		char *base = strrchr(values[Art], '/');
+		values[Name] = base ? base + 1 : values[Art];
+		int index = library_append(values);
+		char *dot = strrchr(games[index].value[Name], '.');
+		if (dot && dot != games[index].value[Name]) *dot = 0;
+		if (i < argc && strcmp(argv[i], "--")) games[index].command = argv + i;
 		while (i < argc && strcmp(argv[i], "--")) ++i;
 		if (i < argc) {
 			argv[i++] = NULL;
 			if (i == argc) die("expected a cover path after --");
 		}
-		++count;
 	}
-	action.sa_flags = SA_NOCLDWAIT;
-	action.sa_handler = SIG_DFL;
-	sigemptyset(&action.sa_mask);
-	if (sigaction(SIGCHLD, &action, NULL) < 0) die(strerror(errno));
 	display = wl_display_connect(NULL);
 	if (!display) die("cannot connect to Wayland display");
 	xkb = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
@@ -343,19 +496,11 @@ int main(int argc, char **argv)
 	wl_registry_add_listener(registry, &registry_events, NULL);
 	if (wl_display_roundtrip(display) < 0) die("cannot read Wayland registry");
 	if (!compositor || !shm || !wm) die("compositor lacks wl_compositor, wl_shm or xdg-shell");
-	surface = wl_compositor_create_surface(compositor);
-	shell_surface = xdg_wm_base_get_xdg_surface(wm, surface);
-	xdg_surface_add_listener(shell_surface, &surface_events, NULL);
-	window = xdg_surface_get_toplevel(shell_surface);
-	xdg_toplevel_add_listener(window, &window_events, NULL);
-	xdg_toplevel_set_title(window, "ludus");
-	xdg_toplevel_set_app_id(window, "ludus");
-	xdg_toplevel_set_min_size(window, COVER_WIDTH + 2 * SPACING, Header + CoverHeight + 2 * SPACING);
-	wl_surface_commit(surface);
-	while (running) {
-		if (wl_display_dispatch(display) < 0) die("Wayland connection lost");
-		if (running) redraw();
-	}
+	create_view(&main_view, "ludus");
+	xdg_toplevel_set_min_size(main_view.window, COVER_WIDTH + 2 * SPACING,
+	                          Header + Footer + CoverHeight + 2 * SPACING);
+	wl_surface_commit(main_view.surface);
+	event_loop();
 	wl_display_disconnect(display);
 	return 0;
 }

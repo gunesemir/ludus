@@ -40,7 +40,8 @@ at the cursor. Enter saves your changes and Escape cancels.
 
 You can also edit games by hand. Each one has a file in `~/.ludus/`, with one
 `key=value` per line. Only `name` and either `exe` or `cmd` are required.
-Here’s an example for `~/.ludus/Black Mesa.meta`.
+If the file changes while the game editor is open, Ludus asks you to reopen
+the editor before saving. Here’s an example for `~/.ludus/Black Mesa.meta`.
 
 ```ini
 name=Black Mesa
@@ -70,5 +71,7 @@ command line. Separate games with `--`.
 ```sh
 ./ludus 'covers/Portal 2.jpg' steam -applaunch 620 -- covers/DOOM.png gzdoom
 ```
+
+Saving one of these games with `e` also saves the directory you started it from.
 
 The bundled `stb_image.h` (revision `5c20573`) includes its license.

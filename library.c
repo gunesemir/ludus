@@ -2,6 +2,8 @@
 #include <dirent.h>
 #include <errno.h>
 #include <limits.h>
+#include <fcntl.h>
+#include <sys/file.h>
 #include <spawn.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -72,13 +74,19 @@ static int game_path(char *dest, const char *name)
 	return join(dest, dir, file);
 }
 
+static int same_revision(const struct stat *a, const struct stat *b)
+{
+	return a->st_dev == b->st_dev && a->st_ino == b->st_ino && a->st_size == b->st_size &&
+	       a->st_mtim.tv_sec == b->st_mtim.tv_sec && a->st_mtim.tv_nsec == b->st_mtim.tv_nsec;
+}
+
 /* Publish the new entry before retiring a previous title. */
-static int write_game(const char *dest, const char *existing, char *const values[FieldCount])
+static int write_game(const char *dest, const struct game *old, char *const values[FieldCount], struct stat *revision)
 {
 	char temp[PATH_MAX];
 	int fd, error = 0;
 	FILE *f;
-	if (mkdir(dir, 0700) && errno != EEXIST) return -1;
+	const char *existing = old ? old->path : NULL;
 	if (join(temp, dir, ".new-XXXXXX")) return -1;
 	fd = mkstemp(temp);
 	if (fd < 0) return -1;
@@ -87,7 +95,13 @@ static int write_game(const char *dest, const char *existing, char *const values
 	else {
 		for (int i = 0; i < FieldCount; ++i)
 			if (fprintf(f, "%s=%s\n", keys[i], values[i]) < 0) { error = errno; break; }
+		if (!error && (fflush(f) || fstat(fd, revision))) error = errno;
 		if (fclose(f)) error = errno;
+	}
+	if (!error && existing) {
+		struct stat current;
+		if (lstat(existing, &current)) error = errno == ENOENT ? ESTALE : errno;
+		else if (!same_revision(&old->revision, &current)) error = ESTALE;
 	}
 	if (!error && existing && !strcmp(existing, dest)) {
 		if (!rename(temp, dest)) return 0;
@@ -128,16 +142,34 @@ static int read_meta(FILE *f, char **values)
 	return ok && !ferror(f);
 }
 
+/* Both snapshots refer to the descriptor from which we parsed the entry. */
+static int load_values(const char *path, char **values, struct stat *revision)
+{
+	struct stat after;
+	int fd = open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK | O_NOFOLLOW);
+	if (fd < 0) return -1;
+	FILE *f = fdopen(fd, "r");
+	int error = 0;
+	if (!f) { error = errno; close(fd); errno = error; return -1; }
+	if (fstat(fd, revision)) error = errno;
+	else if (!S_ISREG(revision->st_mode)) error = ESTALE;
+	else if (!read_meta(f, values) || !valid(values)) error = EINVAL;
+	else if (fstat(fd, &after)) error = errno;
+	else if (!same_revision(revision, &after)) error = ESTALE;
+	fclose(f);
+	if (error) { errno = error; return -1; }
+	return 0;
+}
+
 static void read_game(const char *path)
 {
 	char *values[FieldCount] = {0};
-	FILE *f = fopen(path, "r");
-	if (!f) { perror(path); return; }
-	if (read_meta(f, values) && valid(values)) {
+	struct stat revision;
+	if (!load_values(path, values, &revision)) {
 		int index = library_append(values);
 		games[index].path = copy(path);
-	} else fprintf(stderr, "ludus: invalid entry: %s\n", path);
-	fclose(f);
+		games[index].revision = revision;
+	} else perror(path);
 	for (int i = 0; i < FieldCount; ++i) free(values[i]);
 }
 
@@ -161,31 +193,71 @@ void library_load(void)
 	free(entries);
 }
 
+static void replace_values(struct game *g, char *const values[FieldCount])
+{
+	if (strcmp(g->value[Art], values[Art])) {
+		free(g->thumbnail);
+		g->thumbnail = NULL;
+		g->tried = 0;
+	}
+	for (int i = 0; i < FieldCount; ++i) {
+		free(g->value[i]);
+		g->value[i] = copy(values[i]);
+	}
+	g->command = NULL;
+}
+
+int library_refresh(int index)
+{
+	struct game *g = &games[index];
+	struct stat current;
+	if (!g->path) return 0;
+	if (lstat(g->path, &current)) return -1;
+	if (!S_ISREG(current.st_mode)) { errno = ESTALE; return -1; }
+	if (same_revision(&g->revision, &current)) return 0;
+	char *values[FieldCount] = {0};
+	int result = load_values(g->path, values, &current);
+	int error = errno;
+	if (!result) {
+		replace_values(g, values);
+		g->revision = current;
+	}
+	for (int i = 0; i < FieldCount; ++i) free(values[i]);
+	errno = error;
+	return result;
+}
+
 int library_save(int index, char *const values[FieldCount])
 {
 	char dest[PATH_MAX];
-	const char *existing = index >= 0 ? games[index].path : NULL;
+	struct stat revision;
 	if (!valid(values)) { errno = EINVAL; return -1; }
 	if (!*dir) { errno = ENOENT; return -1; }
-	if (game_path(dest, values[Name]) || write_game(dest, existing, values)) return -1;
-	if (index < 0) {
-		index = library_append(values);
-	} else {
-		struct game *g = &games[index];
-		if (strcmp(g->value[Art], values[Art])) {
-			free(g->thumbnail);
-			g->thumbnail = NULL;
-			g->tried = 0;
-		}
-		for (int i = 0; i < FieldCount; ++i) {
-			free(g->value[i]);
-			g->value[i] = copy(values[i]);
-		}
-		g->command = NULL;
-	}
+	if (game_path(dest, values[Name])) return -1;
+	if (mkdir(dir, 0700) && errno != EEXIST) return -1;
+	int fd = open(dir, O_DIRECTORY | O_RDONLY | O_CLOEXEC);
+	if (fd < 0) return -1;
+	int result = flock(fd, LOCK_EX);
+	if (!result) result = write_game(dest, index >= 0 ? &games[index] : NULL, values, &revision);
+	int error = errno;
+	close(fd);
+	if (result) { errno = error; return -1; }
+	if (index < 0) index = library_append(values);
+	else replace_values(&games[index], values);
 	free(games[index].path);
 	games[index].path = copy(dest);
+	games[index].revision = revision;
 	return index;
+}
+
+void library_finish(void)
+{
+	for (int i = 0; i < count; ++i) {
+		free(games[i].path);
+		free(games[i].thumbnail);
+		for (int j = 0; j < FieldCount; ++j) free(games[i].value[j]);
+	}
+	free(games);
 }
 
 /* File actions run in the child, before PATH lookup and exec. */

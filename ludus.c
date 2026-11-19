@@ -2,6 +2,8 @@
 #include <errno.h>
 #include <limits.h>
 #include <poll.h>
+#include <signal.h>
+#include <sys/timerfd.h>
 #include <sys/wait.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -36,13 +38,14 @@ struct view {
 	struct wl_surface *surface;
 	struct xdg_surface *shell;
 	struct xdg_toplevel *window;
-	int width, height, configured, dirty, busy;
+	struct frame *frames[2];
+	int width, height, configured, dirty;
 };
 struct frame {
 	struct wl_buffer *buffer;
 	uint32_t *pixels;
 	size_t bytes;
-	struct view *owner;
+	struct frame **slot;
 };
 static struct view main_view = { .width = 900, .height = 640 }, dialog;
 static struct wl_surface *focus;
@@ -51,6 +54,7 @@ static char fields[FieldCount][PATH_MAX], form_error[256], status[PATH_MAX + 128
 static int searching, search_origin, found, paste_target;
 static char query[PATH_MAX];
 static size_t query_cursor;
+static int submit_after_paste;
 static enum field field;
 static size_t cursor[FieldCount];
 static int editing;
@@ -66,6 +70,16 @@ static struct wl_keyboard *keyboard;
 static struct xdg_wm_base *wm;
 static struct xkb_context *xkb;
 static struct xkb_state *keys;
+static int repeat_fd, repeat_rate = 25, repeat_delay = 600;
+static uint32_t repeat_code;
+
+static void stop_repeat(void)
+{
+	if (!repeat_code) return;
+	struct itimerspec off = {0};
+	if (timerfd_settime(repeat_fd, 0, &off, NULL)) { perror("timerfd_settime"); exit(EXIT_FAILURE); }
+	repeat_code = 0;
+}
 
 static void die(const char *message)
 {
@@ -180,10 +194,20 @@ static void released(void *data, struct wl_buffer *buffer)
 	struct frame *frame = data;
 	wl_buffer_destroy(buffer);
 	munmap(frame->pixels, frame->bytes);
-	--frame->owner->busy;
+	*frame->slot = NULL;
 	free(frame);
 }
 static const struct wl_buffer_listener buffer_events = { .release = released };
+
+static void destroy_view(struct view *v)
+{
+	xdg_toplevel_destroy(v->window);
+	xdg_surface_destroy(v->shell);
+	wl_surface_destroy(v->surface);
+	for (size_t i = 0; i < 2; ++i)
+		if (v->frames[i]) released(v->frames[i], v->frames[i]->buffer);
+	*v = (struct view){0};
+}
 
 static void redraw(struct view *v)
 {
@@ -192,12 +216,15 @@ static void redraw(struct view *v)
 	struct wl_shm_pool *pool;
 	int fd;
 	int width = v->width, height = v->height;
-	if (!v->configured || !v->dirty || v->busy >= 2) return;
+	if (!v->configured || !v->dirty) return;
+	struct frame **slot = v->frames[0] ? &v->frames[1] : &v->frames[0];
+	if (*slot) return;
 	if ((int64_t)width * height > INT32_MAX / 4)
 		die("window too large for a Wayland shared memory buffer");
 	frame = calloc(1, sizeof(*frame));
 	if (!frame) die("out of memory");
-	frame->owner = v;
+	frame->slot = slot;
+	*slot = frame;
 	frame->bytes = (size_t)width * height * 4;
 	fd = mkstemp(path);
 	if (fd < 0) die(strerror(errno));
@@ -217,7 +244,6 @@ static void redraw(struct view *v)
 	wl_surface_attach(v->surface, frame->buffer, 0, 0);
 	wl_surface_damage(v->surface, 0, 0, width, height);
 	wl_surface_commit(v->surface);
-	++v->busy;
 	v->dirty = 0;
 }
 
@@ -247,6 +273,8 @@ static void save_form(void)
 	if (result < 0 && errno == EEXIST) {
 		field = Name;
 		strcpy(form_error, "A config with this name already exists.");
+	} else if (result < 0 && errno == ESTALE) {
+		strcpy(form_error, "File changed. Esc, then reopen to reload.");
 	} else if (result < 0) snprintf(form_error, sizeof form_error, "Save failed: %s", strerror(errno));
 	else { selected = result; close_dialog(); }
 }
@@ -265,15 +293,16 @@ static size_t next_char(const char *s, size_t pos)
 	return pos;
 }
 
-static void insert_text(char *value, size_t *cursor_pos, const char *str)
+static int insert_text(char *value, size_t *cursor_pos, const char *str)
 {
 	size_t pos = *cursor_pos, len = strlen(value), n = strlen(str);
 	int chars;
 	int size;
-	if (n >= PATH_MAX - len || !FcUtf8Len((const FcChar8 *)str, (int)n, &chars, &size)) return;
+	if (n >= PATH_MAX - len || !FcUtf8Len((const FcChar8 *)str, (int)n, &chars, &size)) return 0;
 	memmove(value + pos + n, value + pos, len - pos + 1);
 	memcpy(value + pos, str, n);
 	*cursor_pos += n;
+	return 1;
 }
 
 static void edit_line(char *value, size_t *cursor_pos, xkb_keysym_t sym, uint32_t code)
@@ -415,6 +444,7 @@ static void keymap(void *data, struct wl_keyboard *kb, uint32_t format, int fd, 
 	char *text;
 	struct xkb_keymap *map;
 	(void)data; (void)kb;
+	stop_repeat();
 	xkb_state_unref(keys);
 	keys = NULL;
 	if (format == WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1 && size) {
@@ -434,35 +464,78 @@ static void modifiers(void *data, struct wl_keyboard *kb, uint32_t serial, uint3
                       uint32_t latched, uint32_t locked, uint32_t group)
 {
 	(void)data; (void)kb; (void)serial;
-	if (keys) xkb_state_update_mask(keys, depressed, latched, locked, 0, 0, group);
+	if (keys && xkb_state_update_mask(keys, depressed, latched, locked, 0, 0, group)) stop_repeat();
 }
+static int paste_shortcut(xkb_keysym_t sym)
+{
+	return (sym == XKB_KEY_v && xkb_state_mod_name_is_active(keys, XKB_MOD_NAME_CTRL, XKB_STATE_MODS_EFFECTIVE) > 0) ||
+	       (sym == XKB_KEY_Insert && xkb_state_mod_name_is_active(keys, XKB_MOD_NAME_SHIFT, XKB_STATE_MODS_EFFECTIVE) > 0);
+}
+
+static int handle_press(uint32_t code)
+{
+	xkb_keysym_t sym = xkb_state_key_get_one_sym(keys, code);
+	int in_form = dialog.surface && focus == dialog.surface;
+	int in_search = searching && focus == main_view.surface;
+	if (in_form || in_search) {
+		int submit = sym == XKB_KEY_Return || sym == XKB_KEY_KP_Enter;
+		if (submit && clipboard_fd() >= 0) {
+			submit_after_paste = 1;
+			return 0;
+		}
+		if (submit_after_paste && sym != XKB_KEY_Escape) return 0;
+		if (sym == XKB_KEY_Escape) submit_after_paste = 0;
+		if (paste_shortcut(sym)) {
+			paste_target = in_form ? (int)field : FieldCount;
+			clipboard_receive();
+			return 0;
+		}
+		if (in_form) form_key(sym, code);
+		else search_key(sym, code);
+		return !submit && sym != XKB_KEY_Escape && sym != XKB_KEY_Tab && sym != XKB_KEY_ISO_Left_Tab;
+	}
+	if (dialog.surface || focus != main_view.surface) return 0;
+	press(sym);
+	return sym == KEY_LEFT || sym == KEY_RIGHT || sym == KEY_UP || sym == KEY_DOWN;
+}
+
 static void key(void *data, struct wl_keyboard *kb, uint32_t serial, uint32_t time,
                 uint32_t code, uint32_t state)
 {
 	(void)data; (void)kb; (void)serial; (void)time;
-	if (!keys || state != WL_KEYBOARD_KEY_STATE_PRESSED) return;
-	xkb_keysym_t sym = xkb_state_key_get_one_sym(keys, code + 8);
-	int in_form = dialog.surface && focus == dialog.surface;
-	if ((in_form || (searching && focus == main_view.surface)) &&
-	    ((sym == XKB_KEY_v && xkb_state_mod_name_is_active(keys, XKB_MOD_NAME_CTRL, XKB_STATE_MODS_EFFECTIVE) > 0) ||
-	     (sym == XKB_KEY_Insert && xkb_state_mod_name_is_active(keys, XKB_MOD_NAME_SHIFT, XKB_STATE_MODS_EFFECTIVE) > 0))) {
-		paste_target = in_form ? (int)field : FieldCount;
-		clipboard_receive();
+	code += 8;
+	if (state == WL_KEYBOARD_KEY_STATE_RELEASED) {
+		if (code == repeat_code) stop_repeat();
 		return;
 	}
-	if (dialog.surface) {
-		if (focus == dialog.surface) form_key(sym, code + 8);
-	} else if (focus == main_view.surface) {
-		if (searching) search_key(sym, code + 8);
-		else press(sym);
-	}
+	stop_repeat();
+	if (!keys || !handle_press(code) || repeat_rate <= 0 ||
+	    !xkb_keymap_key_repeats(xkb_state_get_keymap(keys), code)) return;
+	struct itimerspec timer = {0};
+	long period = 1000000000L / repeat_rate;
+	if (!period) period = 1;
+	timer.it_interval.tv_sec = period / 1000000000L;
+	timer.it_interval.tv_nsec = period % 1000000000L;
+	timer.it_value.tv_sec = repeat_delay / 1000;
+	timer.it_value.tv_nsec = (repeat_delay % 1000) * 1000000L;
+	if (!repeat_delay) timer.it_value.tv_nsec = 1;
+	if (timerfd_settime(repeat_fd, 0, &timer, NULL)) die(strerror(errno));
+	repeat_code = code;
+}
+
+static void repeat_info(void *data, struct wl_keyboard *kb, int32_t rate, int32_t delay)
+{
+	(void)data; (void)kb;
+	stop_repeat();
+	repeat_rate = rate;
+	repeat_delay = delay < 0 ? 0 : delay;
 }
 static void enter(void *d, struct wl_keyboard *k, uint32_t s, struct wl_surface *w, struct wl_array *a)
-{ (void)d; (void)k; (void)s; focus = w; (void)a; }
+{ (void)d; (void)k; (void)s; stop_repeat(); focus = w; (void)a; }
 static void leave(void *d, struct wl_keyboard *k, uint32_t s, struct wl_surface *w)
-{ (void)d; (void)k; (void)s; if (focus == w) focus = NULL; }
+{ (void)d; (void)k; (void)s; stop_repeat(); if (focus == w) focus = NULL; }
 static const struct wl_keyboard_listener keyboard_events = {
-	.keymap = keymap, .enter = enter, .leave = leave, .key = key, .modifiers = modifiers
+	.keymap = keymap, .enter = enter, .leave = leave, .key = key, .modifiers = modifiers, .repeat_info = repeat_info
 };
 
 static void capabilities(void *data, struct wl_seat *s, uint32_t caps)
@@ -472,11 +545,16 @@ static void capabilities(void *data, struct wl_seat *s, uint32_t caps)
 		keyboard = wl_seat_get_keyboard(s);
 		wl_keyboard_add_listener(keyboard, &keyboard_events, NULL);
 	} else if (!(caps & WL_SEAT_CAPABILITY_KEYBOARD) && keyboard) {
-		wl_keyboard_destroy(keyboard);
+		stop_repeat();
+		if (wl_keyboard_get_version(keyboard) >= WL_KEYBOARD_RELEASE_SINCE_VERSION)
+			wl_keyboard_release(keyboard);
+		else wl_keyboard_destroy(keyboard);
 		keyboard = NULL;
 	}
 }
-static const struct wl_seat_listener seat_events = { .capabilities = capabilities };
+static void seat_named(void *data, struct wl_seat *s, const char *name)
+{ (void)data; (void)s; (void)name; }
+static const struct wl_seat_listener seat_events = { .capabilities = capabilities, .name = seat_named };
 
 static void ping(void *data, struct xdg_wm_base *base, uint32_t serial)
 { (void)data; xdg_wm_base_pong(base, serial); }
@@ -495,7 +573,9 @@ static void global(void *data, struct wl_registry *r, uint32_t id, const char *n
 	} else if (!strcmp(name, "wl_data_device_manager")) {
 		clipboard_bind(r, id);
 	} else if (!seat && !strcmp(name, "wl_seat")) {
-		seat = wl_registry_bind(r, id, &wl_seat_interface, 1);
+		seat = wl_registry_bind(r, id, &wl_seat_interface, version < 4 ? version : 4);
+		repeat_rate = 25;
+		repeat_delay = 600;
 		seat_name = id;
 		clipboard_seat(seat);
 		wl_seat_add_listener(seat, &seat_events, NULL);
@@ -507,6 +587,7 @@ static void removed(void *data, struct wl_registry *r, uint32_t id)
 	if (seat && id == seat_name) {
 		capabilities(NULL, seat, 0);
 		clipboard_seat(NULL);
+		submit_after_paste = 0;
 		wl_seat_destroy(seat);
 		seat = NULL;
 	}
@@ -577,6 +658,11 @@ static void open_dialog(int index)
 	memset(fields, 0, sizeof fields);
 	if (index >= 0) {
 		struct game *g = &games[index];
+		if (library_refresh(index)) {
+			snprintf(status, sizeof status, "Cannot read entry: %s", strerror(errno));
+			main_view.dirty = 1;
+			return;
+		}
 		for (int i = 0; i < FieldCount; ++i) {
 			if (strlen(g->value[i]) >= sizeof fields[i] || strchr(g->value[i], '\n')) goto uneditable;
 			strcpy(fields[i], g->value[i]);
@@ -587,7 +673,10 @@ static void open_dialog(int index)
 			    snprintf(fields[Art], PATH_MAX, "%s/%s", cwd, g->value[Art]) >= PATH_MAX)
 				goto uneditable;
 		}
-		if (g->command && command_text(g->command)) goto uneditable;
+		if (g->command) {
+			if (!getcwd(fields[Workdir], sizeof fields[Workdir]) || command_text(g->command))
+				goto uneditable;
+		}
 	}
 	for (int i = 0; i < FieldCount; ++i) cursor[i] = strlen(fields[i]);
 	field = Name;
@@ -609,17 +698,37 @@ static void close_dialog(void)
 {
 	clipboard_cancel();
 	if (focus == dialog.surface) focus = NULL;
-	xdg_toplevel_destroy(dialog.window);
-	xdg_surface_destroy(dialog.shell);
-	wl_surface_destroy(dialog.surface);
-	dialog.surface = NULL;
-	dialog.configured = 0;
+	stop_repeat();
+	submit_after_paste = 0;
+	destroy_view(&dialog);
 	main_view.dirty = 1;
+}
+
+static void finish_paste(void)
+{
+	const char *s = clipboard_read();
+	if (clipboard_fd() >= 0) return;
+	int submit = submit_after_paste;
+	submit_after_paste = 0;
+	if (searching && paste_target == FieldCount) {
+		if (s && insert_text(query, &query_cursor, s)) {
+			found = find_title(search_origin, 1);
+			if (submit) search_key(XKB_KEY_Return, 0);
+		}
+		main_view.dirty = 1;
+	} else if (dialog.surface && paste_target < FieldCount) {
+		if (!s || !insert_text(fields[paste_target], &cursor[paste_target], s))
+			strcpy(form_error, "Cannot paste this text.");
+		else if (submit) save_form();
+		dialog.dirty = 1;
+	}
 }
 
 static void event_loop(void)
 {
-	struct pollfd fds[2] = {{.fd = wl_display_get_fd(display)}, {.events = POLLIN}};
+	struct pollfd fds[] = {
+		{.fd = wl_display_get_fd(display)}, {.events = POLLIN}, {.fd = repeat_fd, .events = POLLIN}
+	};
 	while (running) {
 		if (wl_display_dispatch_pending(display) < 0) die("Wayland connection lost");
 		if (!running) break;
@@ -632,23 +741,18 @@ static void event_loop(void)
 			fds[0].events |= POLLOUT;
 		}
 		fds[1].fd = clipboard_fd();
-		if (poll(fds, 2, active ? 150 : -1) < 0) {
+		if (poll(fds, 3, active ? 150 : -1) < 0) {
 			if (errno == EINTR) continue;
 			die(strerror(errno));
 		}
-		if (fds[1].revents) {
-			const char *s = clipboard_read();
-			if (s && paste_target == FieldCount && searching) {
-				insert_text(query, &query_cursor, s);
-				found = find_title(search_origin, 1);
-				main_view.dirty = 1;
-			} else if (s && dialog.surface && paste_target < FieldCount) {
-				insert_text(fields[paste_target], &cursor[paste_target], s);
-				dialog.dirty = 1;
-			}
-		}
+		if (fds[1].revents) finish_paste();
 		if (fds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) die("Wayland connection lost");
 		if ((fds[0].revents & POLLIN) && wl_display_dispatch(display) < 0) die("Wayland connection lost");
+		if (fds[2].revents & POLLIN) {
+			uint64_t ticks;
+			if (read(repeat_fd, &ticks, sizeof ticks) == sizeof ticks &&
+			    repeat_code && !handle_press(repeat_code)) stop_repeat();
+		}
 	}
 }
 
@@ -656,6 +760,11 @@ int main(int argc, char **argv)
 {
 	struct wl_registry *registry;
 	int i;
+	struct sigaction action = { .sa_handler = SIG_DFL };
+	sigemptyset(&action.sa_mask);
+	if (sigaction(SIGCHLD, &action, NULL)) die(strerror(errno));
+	repeat_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+	if (repeat_fd < 0) die(strerror(errno));
 	font_init(FONT_PATTERN);
 	library_load();
 	for (i = 1; i < argc;) {
@@ -687,6 +796,22 @@ int main(int argc, char **argv)
 	                          Header + Footer + TileHeight + 2 * SPACING);
 	wl_surface_commit(main_view.surface);
 	event_loop();
+	if (dialog.surface) close_dialog();
+	destroy_view(&main_view);
+	clipboard_finish();
+	if (seat) {
+		capabilities(NULL, seat, 0);
+		wl_seat_destroy(seat);
+	}
+	xdg_wm_base_destroy(wm);
+	wl_shm_destroy(shm);
+	wl_compositor_destroy(compositor);
+	wl_registry_destroy(registry);
 	wl_display_disconnect(display);
+	close(repeat_fd);
+	xkb_state_unref(keys);
+	xkb_context_unref(xkb);
+	library_finish();
+	font_finish();
 	return 0;
 }

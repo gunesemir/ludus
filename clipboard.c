@@ -70,6 +70,12 @@ void clipboard_bind(struct wl_registry *registry, uint32_t id)
 	clipboard_seat(current_seat);
 }
 
+void clipboard_finish(void)
+{
+	clipboard_seat(NULL);
+	if (manager) wl_data_device_manager_destroy(manager);
+}
+
 void clipboard_cancel(void)
 {
 	if (input >= 0) close(input);

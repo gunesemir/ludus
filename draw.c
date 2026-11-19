@@ -32,6 +32,13 @@ failed:
 	exit(EXIT_FAILURE);
 }
 
+void font_finish(void)
+{
+	FT_Done_Face(face);
+	FT_Done_FreeType(library);
+	FcFini();
+}
+
 void fill(struct canvas c, int x, int y, int w, int h, uint32_t color)
 {
 	int i, j;

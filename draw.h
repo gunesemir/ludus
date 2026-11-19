@@ -3,6 +3,7 @@
 #include <stdint.h>
 
 struct canvas { uint32_t *pixels; int width, height; };
+void font_finish(void);
 void font_init(const char *pattern);
 void fill(struct canvas c, int x, int y, int w, int h, uint32_t color);
 /* Baseline in pixels. Clip horizontally to [left, right). */

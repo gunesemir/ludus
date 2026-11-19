@@ -45,8 +45,7 @@ static int join(char *dst, const char *a, const char *b)
 
 static int valid(char *const v[FieldCount])
 {
-	return *v[Name] && v[Exe][0] == '/' && v[Art][0] == '/' &&
-	       (!strcmp(v[Runner], "wine") || !strcmp(v[Runner], "umu-run")) &&
+	return *v[Name] && (v[Exe][0] == '/' || (!*v[Exe] && *v[Launch])) && v[Art][0] == '/' &&
 	       (!*v[Prefix] || v[Prefix][0] == '/') && (!*v[Proton] || v[Proton][0] == '/');
 }
 
@@ -62,11 +61,20 @@ static void read_game(const char *entry)
 	for (i = 0; i < FieldCount; ++i) {
 		size_t cap = 0;
 		ssize_t n = getline(&values[i], &cap, f);
+		if (i == Launch && n < 0 && feof(f) && !ferror(f)) {
+			/* Entries written before launch commands had six lines. */
+			free(values[i]);
+			values[i] = copy("");
+			++i;
+			break;
+		}
 		if (n < 1 || values[i][n-1] != '\n' || memchr(values[i], 0, n)) break;
 		values[i][n-1] = 0;
 	}
-	if (i == FieldCount && valid(values)) library_append(values);
-	else fprintf(stderr, "ludus: invalid entry: %s\n", path);
+	if (i == FieldCount && valid(values)) {
+		int index = library_append(values);
+		games[index].path = copy(path);
+	} else fprintf(stderr, "ludus: invalid entry: %s\n", path);
 	fclose(f);
 	for (i = 0; i < FieldCount; ++i) free(values[i]);
 }
@@ -106,8 +114,8 @@ static int create_dirs(void)
 	}
 }
 
-/* Publish a complete entry with one link; parallel writers never overwrite. */
-int library_save(char *const values[FieldCount])
+/* Write the whole record before publishing it or replacing an existing one. */
+int library_save(int index, char *const values[FieldCount])
 {
 	char temp[PATH_MAX], dest[PATH_MAX];
 	int fd, error = 0;
@@ -124,20 +132,49 @@ int library_save(char *const values[FieldCount])
 			if (fprintf(f, "%s\n", values[i]) < 0) { error = errno; break; }
 		if (fclose(f)) error = errno;
 	}
-	if (!error) {
+	const char *existing = index >= 0 ? games[index].path : NULL;
+	if (!error && existing) {
+		if (rename(temp, existing)) error = errno;
+	} else if (!error) {
 		strcpy(dest, temp);
 		memcpy(strrchr(dest, '/') + 1, "game-", 5);
 		if (link(temp, dest)) error = errno;
 	}
-	unlink(temp);
+	if (!existing || error) unlink(temp);
 	if (error) { errno = error; return -1; }
-	return library_append(values);
+	if (index < 0) {
+		index = library_append(values);
+	} else {
+		struct game *g = &games[index];
+		if (strcmp(g->value[Art], values[Art])) {
+			free(g->thumbnail);
+			g->thumbnail = NULL;
+			g->tried = 0;
+		}
+		for (int i = 0; i < FieldCount; ++i) {
+			free(g->value[i]);
+			g->value[i] = copy(values[i]);
+		}
+		g->command = NULL;
+	}
+	if (!existing) games[index].path = copy(dest);
+	return index;
 }
 
 int game_launch(struct game *g)
 {
-	char *runner[] = {g->value[Runner], g->value[Exe], NULL};
-	char **args = g->command ? g->command : runner;
+	char *launch[7], **args = launch;
+	size_t argc = 0;
+	if (*g->value[Launch]) {
+		launch[argc++] = "/bin/sh";
+		launch[argc++] = "-c";
+		launch[argc++] = g->value[Launch];
+		launch[argc++] = "ludus";
+	}
+	if (*g->value[Runner]) launch[argc++] = g->value[Runner];
+	if (*g->value[Exe]) launch[argc++] = g->value[Exe];
+	launch[argc] = NULL;
+	if (g->command) args = g->command;
 	char *prefix = g->value[Prefix], *proton = g->value[Proton];
 	char prefix_env[PATH_MAX + 12], proton_env[PATH_MAX + 12];
 	char **env;
@@ -145,8 +182,7 @@ int game_launch(struct game *g)
 	int error;
 	pid_t pid;
 	if (g->pid) return EALREADY;
-	if (!*args[0]) return ENOEXEC;
-	if (strcmp(g->value[Runner], "umu-run")) proton = "";
+	if (!args[0] || !*args[0]) return ENOEXEC;
 	if (snprintf(prefix_env, sizeof prefix_env, "WINEPREFIX=%s", prefix) >= (int)sizeof prefix_env ||
 	    snprintf(proton_env, sizeof proton_env, "PROTONPATH=%s", proton) >= (int)sizeof proton_env)
 		return ENAMETOOLONG;

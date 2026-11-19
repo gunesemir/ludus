@@ -3,9 +3,10 @@
 #include <stdint.h>
 #include <sys/types.h>
 
-enum field { Name, Exe, Art, Runner, Prefix, Proton, FieldCount };
+enum field { Name, Exe, Art, Runner, Prefix, Proton, Launch, FieldCount };
 struct game {
 	char *value[FieldCount];
+	char *path; /* File backing a saved entry */
 	char **command; /* Session-only command line entry */
 	uint32_t *thumbnail;
 	pid_t pid;
@@ -15,6 +16,6 @@ extern struct game *games;
 extern int count;
 int library_append(char *const values[FieldCount]);
 void library_load(void);
-int library_save(char *const values[FieldCount]);
+int library_save(int index, char *const values[FieldCount]);
 int game_launch(struct game *g);
 #endif

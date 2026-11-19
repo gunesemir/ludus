@@ -1,7 +1,7 @@
 /* Dimensions are Wayland surface coordinates. Colors are 0xRRGGBB. */
 #define COVER_WIDTH 144
 #define SPACING 16
-#define BORDER_COLOR 0xe5ae63
+#define BORDER_COLOR 0xffffff
 
 #define KEY_LEFT   XKB_KEY_h
 #define KEY_DOWN   XKB_KEY_j
@@ -13,6 +13,6 @@
 #define FONT_PATTERN "Hack,monospace"
 #define FONT_SIZE 16
 #define BACKGROUND 0x000000
-#define HEADER_BACKGROUND 0x888888
 #define BAR_BACKGROUND 0x222222
 #define KEY_ADD XKB_KEY_plus
+#define KEY_EDIT XKB_KEY_e

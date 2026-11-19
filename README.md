@@ -15,17 +15,24 @@ Fontconfig resolves `FONT_PATTERN` to an installed font. The default is
 `"DejaVu Sans:style=Book"`. Use `fc-match 'Hack,monospace'` to see which
 font your system selects.
 
-## Add a game
+## Add or edit a game
 
-Start `./ludus` and press `+`. Enter the game name, absolute executable path,
-and absolute JPEG or PNG artwork path. Use Tab and Shift+Tab to move between
-fields. In the runner field, use Left or Right to select `wine` or `umu-run`.
-Enter saves and selects the game. Escape cancels.
+Press `+` to add a game or `e` to edit the selected game. Enter saves the
+entry and Escape discards the edits. Tab and Shift+Tab switch fields. Use
+Left, Right, Home, and End to move the text cursor, and Backspace or Delete
+to remove a character.
 
-Install your chosen runner on your executable search path. Both runners receive
-the executable as a single argument. Set WINEPREFIX to use a game-specific
-prefix. With umu-run, set PROTONPATH to select a Proton installation. Leave
-either path blank to use the inherited environment and the runner's defaults.
+Enter a name and an absolute JPEG or PNG artwork path. For a direct launch,
+enter the game's absolute executable path. The runner starts blank. Set it
+to a program on PATH or an absolute path to run the executable with that
+program, for example `wine`, `umu-run`, or `/bin/sh`. Set WINEPREFIX or
+PROTONPATH to pass those environment variables to the game.
+
+The optional **Launch command** runs through `/bin/sh -c`. Use `"$@"` to
+insert the configured runner (if present) and executable as separate arguments.
+For example, `exec "$@" -novid` adds a game option and
+`exec gamemoderun "$@"` wraps the launch. You can also leave the executable
+and runner empty and enter a complete command such as `exec steam -applaunch 620`.
 
 Games are saved individually under `$XDG_DATA_HOME/ludus/games/`, which
 defaults to `~/.local/share/ludus/games/`. The bottom bar follows the
@@ -42,7 +49,7 @@ entries with a standalone `--`. For example, using your own cover paths:
 ```
 
 For a cover-only grid, run `./ludus first.jpg -- second.png`. Command-line entries appear
-after your saved library, keep their argument order, and last for this session. Commands launch directly with their argument
+after your saved library, keep their argument order, and last for this session unless you save them with `e`. Commands launch directly with their argument
 boundaries intact and inherit the launcher's environment and working directory.
 
 The bundled stb_image decoder reads JPEG and PNG files as they come into view.

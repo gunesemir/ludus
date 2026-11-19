@@ -29,7 +29,7 @@
 #error "Use a cover width of 2..4096 and spacing of 4..1024."
 #endif
 
-enum { CoverHeight = COVER_WIDTH * 3 / 2, Header = 52, Footer = 36 };
+enum { CoverHeight = COVER_WIDTH * 3 / 2, Header = 52, Footer = FONT_SIZE + 6, Row = FONT_SIZE * 2 + 12, DialogHeight = FieldCount * Row + 8 };
 struct view {
 	struct wl_surface *surface;
 	struct xdg_surface *shell;
@@ -47,8 +47,10 @@ static struct wl_surface *focus;
 static int selected, first_row, running = 1, active;
 static char fields[FieldCount][PATH_MAX], form_error[256], status[PATH_MAX + 128];
 static enum field field;
-static const char *labels[] = {"Name", "Executable", "Artwork", "Runner", "WINEPREFIX", "PROTONPATH"};
-static void open_dialog(void);
+static size_t cursor[FieldCount];
+static int editing;
+static const char *labels[] = {"Name", "Executable", "Artwork", "Runner", "WINEPREFIX", "PROTONPATH", "Launch command"};
+static void open_dialog(int index);
 static void close_dialog(void);
 static struct wl_display *display;
 static struct wl_compositor *compositor;
@@ -108,13 +110,15 @@ static void paint(struct canvas c)
 	int i, y, cols = columns(), width = c.width, height = c.height;
 	int rows = (height - Header - Footer - SPACING) / (CoverHeight + SPACING);
 	int bar = height > Footer ? height - Footer : 0;
-	int split = *status ? width / 2 : width;
+	int right = width - 6;
+	int status_x = right - text_width(FONT_SIZE, status);
+	int split = status_x < width / 3 ? width / 3 : status_x;
 	if (rows < 1) rows = 1;
 	if (first_row > selected / cols) first_row = selected / cols;
 	if (first_row <= selected / cols - rows) first_row = selected / cols - rows + 1;
 	fill(c, 0, 0, width, height, BACKGROUND);
-	fill(c, 0, 0, width, Header, HEADER_BACKGROUND);
-	text(c, SPACING, 34, 0, width, FONT_SIZE + 6, 0, "ludus");
+	fill(c, 0, 0, width, Header, BAR_BACKGROUND);
+	text(c, SPACING, 34, 0, width, FONT_SIZE + 6, 0xffffff, "ludus");
 	for (i = first_row * cols; i < count; ++i) {
 		int left = SPACING + (i % cols) * (COVER_WIDTH + SPACING);
 		int top = Header + SPACING + (i / cols - first_row) * (CoverHeight + SPACING);
@@ -134,35 +138,38 @@ static void paint(struct canvas c)
 			       games[i].thumbnail + y * COVER_WIDTH, visible * sizeof(*c.pixels));
 	}
 	fill(c, 0, bar, width, Footer, BAR_BACKGROUND);
-	text(c, SPACING, bar + 24, 0, split - 4, FONT_SIZE, 0xffffff,
+	text(c, 6, bar + FONT_SIZE + 1, 0, split - 4, FONT_SIZE, 0xffffff,
 	     count ? games[selected].value[Name] : "+ Add game");
 	if (*status)
-		text(c, split, bar + 24, split, width - 4, FONT_SIZE, 0xffffff, status);
+		text(c, status_x, bar + FONT_SIZE + 1, split, right, FONT_SIZE, 0xffffff, status);
 
 }
 
 static void paint_dialog(struct canvas c)
 {
 	int left = 14, right = c.width - 14;
-	int step = (c.height - 82) / FieldCount;
-	if (step < 1) step = 1;
+	int step = (c.height - 8) / FieldCount;
 	fill(c, 0, 0, c.width, c.height, BAR_BACKGROUND);
 	for (int i = 0; i < FieldCount; ++i) {
-		int y = 6 + i * step, start = left + 5;
-		int available = right - start - 5;
-		int used = text_width(FONT_SIZE, fields[i]);
-		fill(c, left, y + 20, right - left, step - 22, i == (int)field ? BORDER_COLOR : 0x555555);
-		fill(c, left + 1, y + 21, right - left - 2, step - 24, 0);
-		text(c, left, y + 15, left, right, FONT_SIZE, 0xffffff, labels[i]);
-		if (i == (int)field && used > available) start -= used - available;
-		text(c, start, y + 40, left + 4, right - 2, FONT_SIZE, 0xffffff, fields[i]);
-		if (i == (int)field)
-			fill(c, start + used + 1, y + 25, 1, 17, BORDER_COLOR);
+		int y = 4 + i * step, start = left + 5;
+		int input_y = y + FONT_SIZE + 2;
+		int available = right - start - 5, offset = 0;
+		int focused = i == (int)field;
+		fill(c, left, input_y, right - left, step - FONT_SIZE - 4, focused ? BORDER_COLOR : 0x555555);
+		fill(c, left + 1, input_y + 1, right - left - 2, step - FONT_SIZE - 6, 0);
+		text(c, left, y + FONT_SIZE - 1, left, right, FONT_SIZE, 0xffffff, labels[i]);
+		if (focused) {
+			char saved = fields[i][cursor[i]];
+			fields[i][cursor[i]] = 0;
+			offset = text_width(FONT_SIZE, fields[i]);
+			fields[i][cursor[i]] = saved;
+			if (offset > available) start -= offset - available;
+			int label_end = left + text_width(FONT_SIZE, labels[i]) + 10;
+			text(c, label_end, y + FONT_SIZE - 1, label_end, right, FONT_SIZE, 0xffffff, form_error);
+		}
+		text(c, start, input_y + FONT_SIZE + 1, left + 4, right - 2, FONT_SIZE, 0xffffff, fields[i]);
+		if (focused) fill(c, start + offset, input_y + 3, 1, FONT_SIZE, BORDER_COLOR);
 	}
-	text(c, left, c.height - 48, left, right, FONT_SIZE, BORDER_COLOR, form_error);
-	text(c, left, c.height - 26, left, right, FONT_SIZE, 0xffffff, "Tab: next   Enter: save   Esc: cancel");
-	if (field == Runner)
-		text(c, left, c.height - 7, left, right, FONT_SIZE, 0xffffff, "Left / Right: choose runner");
 }
 
 static void released(void *data, struct wl_buffer *buffer)
@@ -211,47 +218,78 @@ static void redraw(struct view *v)
 	v->dirty = 0;
 }
 
-static void form_key(xkb_keysym_t sym, uint32_t code)
+static void save_form(void)
 {
-	char *value = fields[field];
-	size_t len = strlen(value);
-	char typed[64];
-	int n;
-	dialog.dirty = 1;
-	if (sym == XKB_KEY_Escape) { close_dialog(); return; }
-	form_error[0] = 0;
-	if (sym == XKB_KEY_Tab) field = (field + 1) % FieldCount;
-	else if (sym == XKB_KEY_ISO_Left_Tab) field = (field + FieldCount - 1) % FieldCount;
-	else if (sym == XKB_KEY_Return || sym == XKB_KEY_KP_Enter) {
-		char *values[FieldCount];
-		for (int i = 0; i < FieldCount; ++i) values[i] = fields[i];
-		if (!*fields[Name]) {
-			strcpy(form_error, "Enter a name.");
-			field = Name;
+	char *values[FieldCount];
+	for (int i = 0; i < FieldCount; ++i) values[i] = fields[i];
+	if (!*fields[Name]) {
+		strcpy(form_error, "Enter a name.");
+		field = Name;
+		return;
+	}
+	if (!*fields[Exe] && !*fields[Launch]) {
+		strcpy(form_error, "Enter a path or a launch command.");
+		field = Exe;
+		return;
+	}
+	for (int i = Exe; i <= Proton; ++i) {
+		if (i == Runner || (i != Art && !*fields[i])) continue;
+		if (*fields[i] != '/') {
+			strcpy(form_error, "Enter an absolute path.");
+			field = i;
 			return;
 		}
-		for (int i = Exe; i < FieldCount; ++i) {
-			if (i == Runner || (i >= Prefix && !*fields[i])) continue;
-			if (*fields[i] != '/') {
-				snprintf(form_error, sizeof form_error, "%s needs an absolute path.", labels[i]);
-				field = i;
-				return;
-			}
-		}
-		int added = library_save(values);
-		if (added < 0) snprintf(form_error, sizeof form_error, "Save failed: %s", strerror(errno));
-		else { selected = added; close_dialog(); }
-	} else if (field == Runner) {
-		if (sym == XKB_KEY_space || sym == XKB_KEY_Left || sym == XKB_KEY_Right)
-			strcpy(value, !strcmp(value, "wine") ? "umu-run" : "wine");
-	} else if (sym == XKB_KEY_BackSpace && len) {
-		do { --len; } while (len && ((unsigned char)value[len] & 0xc0) == 0x80);
-		value[len] = 0;
-	} else {
-		n = xkb_state_key_get_utf8(keys, code, typed, sizeof typed);
-		if (n > 0 && n < (int)sizeof typed && len + n < PATH_MAX &&
-		    (unsigned char)typed[0] >= 32 && typed[0] != 127)
-			memcpy(value + len, typed, n + 1);
+	}
+	int result = library_save(editing, values);
+	if (result < 0) snprintf(form_error, sizeof form_error, "Save failed: %s", strerror(errno));
+	else { selected = result; close_dialog(); }
+}
+
+static size_t previous_char(const char *s, size_t pos)
+{
+	if (!pos) return 0;
+	while (--pos && ((unsigned char)s[pos] & 0xc0) == 0x80) {}
+	return pos;
+}
+
+static size_t next_char(const char *s, size_t pos)
+{
+	if (!s[pos]) return pos;
+	do { ++pos; } while (((unsigned char)s[pos] & 0xc0) == 0x80);
+	return pos;
+}
+
+static void form_key(xkb_keysym_t sym, uint32_t code)
+{
+	char *value = fields[field], typed[64];
+	size_t pos = cursor[field], len = strlen(value);
+	dialog.dirty = 1;
+	form_error[0] = 0;
+	switch (sym) {
+	case XKB_KEY_Escape: close_dialog(); return;
+	case XKB_KEY_Return: case XKB_KEY_KP_Enter: save_form(); return;
+	case XKB_KEY_Tab: field = (field + 1) % FieldCount; return;
+	case XKB_KEY_ISO_Left_Tab: field = (field + FieldCount - 1) % FieldCount; return;
+	case XKB_KEY_Left: cursor[field] = previous_char(value, pos); return;
+	case XKB_KEY_Right: cursor[field] = next_char(value, pos); return;
+	case XKB_KEY_Home: cursor[field] = 0; return;
+	case XKB_KEY_End: cursor[field] = len; return;
+	case XKB_KEY_BackSpace:
+		cursor[field] = previous_char(value, pos);
+		memmove(value + cursor[field], value + pos, len - pos + 1);
+		return;
+	case XKB_KEY_Delete: {
+		size_t next = next_char(value, pos);
+		memmove(value + pos, value + next, len - next + 1);
+		return;
+	}
+	}
+	int n = xkb_state_key_get_utf8(keys, code, typed, sizeof typed);
+	if (n > 0 && n < (int)sizeof typed && len + n < sizeof fields[field] &&
+	    (unsigned char)typed[0] >= 32 && typed[0] != 127) {
+		memmove(value + pos + n, value + pos, len - pos + 1);
+		memcpy(value + pos, typed, n);
+		cursor[field] += n;
 	}
 }
 
@@ -277,8 +315,9 @@ static void press(xkb_keysym_t sym)
 {
 	int col = columns(), old = selected;
 	if (sym == KEY_QUIT) running = 0;
-	if (sym == KEY_ADD || sym == XKB_KEY_KP_Add) { open_dialog(); return; }
+	if (sym == KEY_ADD || sym == XKB_KEY_KP_Add) { open_dialog(-1); return; }
 	if (!count) return;
+	if (sym == KEY_EDIT) { open_dialog(selected); return; }
 	if (sym == KEY_LEFT && selected % col > 0) --selected;
 	if (sym == KEY_RIGHT && selected % col < col - 1 && selected + 1 < count) ++selected;
 	if (sym == KEY_UP && selected >= col) selected -= col;
@@ -417,19 +456,66 @@ static void create_view(struct view *v, const char *title)
 	xdg_toplevel_set_app_id(v->window, "ludus");
 }
 
-static void open_dialog(void)
+/* Represent a CLI entry as editable shell words without losing argv boundaries. */
+static int command_text(char **argv)
 {
+	char *out = fields[Launch], *end = out + sizeof fields[Launch] - 1;
+	for (; *argv; ++argv) {
+		if (out != fields[Launch]) {
+			if (out == end) return -1;
+			*out++ = ' ';
+		}
+		if (out == end) return -1;
+		*out++ = '\'';
+		for (const char *p = *argv; *p; ++p) {
+			if (*p == '\'') {
+				if (end - out < 4) return -1;
+				memcpy(out, "'\\''", 4);
+				out += 4;
+			} else {
+				if (out == end || *p == '\n') return -1;
+				*out++ = *p;
+			}
+		}
+		if (out == end) return -1;
+		*out++ = '\'';
+	}
+	*out = 0;
+	return 0;
+}
+
+static void open_dialog(int index)
+{
+	editing = index;
 	memset(fields, 0, sizeof fields);
-	strcpy(fields[Runner], "wine");
+	if (index >= 0) {
+		struct game *g = &games[index];
+		for (int i = 0; i < FieldCount; ++i) {
+			if (strlen(g->value[i]) >= sizeof fields[i] || strchr(g->value[i], '\n')) goto uneditable;
+			strcpy(fields[i], g->value[i]);
+		}
+		if (fields[Art][0] != '/') {
+			char cwd[PATH_MAX];
+			if (!getcwd(cwd, sizeof cwd) ||
+			    snprintf(fields[Art], PATH_MAX, "%s/%s", cwd, g->value[Art]) >= PATH_MAX)
+				goto uneditable;
+		}
+		if (g->command && command_text(g->command)) goto uneditable;
+	}
+	for (int i = 0; i < FieldCount; ++i) cursor[i] = strlen(fields[i]);
 	field = Name;
 	form_error[0] = 0;
 	dialog.width = 520;
-	dialog.height = 400;
-	create_view(&dialog, "Add game");
+	dialog.height = DialogHeight;
+	create_view(&dialog, index < 0 ? "Add game" : "Edit game");
 	xdg_toplevel_set_parent(dialog.window, main_view.window);
-	xdg_toplevel_set_min_size(dialog.window, 420, 380);
-	xdg_toplevel_set_max_size(dialog.window, 520, 400);
+	xdg_toplevel_set_min_size(dialog.window, 420, DialogHeight);
+	xdg_toplevel_set_max_size(dialog.window, 520, DialogHeight);
 	wl_surface_commit(dialog.surface);
+	return;
+uneditable:
+	strcpy(status, "Entry exceeds the single-line field limits");
+	main_view.dirty = 1;
 }
 
 static void close_dialog(void)

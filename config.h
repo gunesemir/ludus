@@ -22,3 +22,6 @@
 #define KEY_ADD           XKB_KEY_plus
 #define KEY_EDIT          XKB_KEY_e
 #define KEY_QUIT          XKB_KEY_q
+#define KEY_SEARCH        XKB_KEY_slash
+#define KEY_NEXT_MATCH    XKB_KEY_n
+#define KEY_PREV_MATCH    XKB_KEY_N

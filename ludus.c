@@ -14,16 +14,10 @@
 #include <xkbcommon/xkbcommon.h>
 #include "xdg-shell-client-protocol.h"
 #include "config.h"
+#include "clipboard.h"
+#include <fontconfig/fontconfig.h>
 #include "draw.h"
 #include "library.h"
-
-#define STBI_ONLY_PNG
-#define STBI_ONLY_JPEG
-#define STBI_NO_HDR
-#define STBI_NO_LINEAR
-#define STBI_MAX_DIMENSIONS 16384
-#define STB_IMAGE_IMPLEMENTATION
-#include "vendor/stb_image.h"
 
 #if COVER_WIDTH < 2 || COVER_WIDTH > 4096 || SPACING < 4 || SPACING > 1024
 #error "Use a cover width of 2..4096 and spacing of 4..1024."
@@ -54,6 +48,9 @@ static struct view main_view = { .width = 900, .height = 640 }, dialog;
 static struct wl_surface *focus;
 static int selected, first_row, running = 1, active;
 static char fields[FieldCount][PATH_MAX], form_error[256], status[PATH_MAX + 128];
+static int searching, search_origin, found, paste_target;
+static char query[PATH_MAX];
+static size_t query_cursor;
 static enum field field;
 static size_t cursor[FieldCount];
 static int editing;
@@ -76,37 +73,6 @@ static void die(const char *message)
 	exit(EXIT_FAILURE);
 }
 
-/* Decode on first use and retain only the display-sized center crop. */
-static void load_cover(struct game *g)
-{
-	int w, h, channels, sw, sh, x, y;
-	unsigned char *src;
-	g->tried = 1;
-	src = stbi_load(g->value[Art], &w, &h, &channels, 3);
-	if (!src) {
-		fprintf(stderr, "ludus: %s: %s\n", g->value[Art], stbi_failure_reason());
-		return;
-	}
-	g->thumbnail = malloc((size_t)COVER_WIDTH * CoverHeight * sizeof(uint32_t));
-	if (!g->thumbnail)
-		die("out of memory");
-	sw = w;
-	sh = h;
-	if ((int64_t)w * CoverHeight > (int64_t)h * COVER_WIDTH)
-		sw = h * COVER_WIDTH / CoverHeight;
-	else
-		sh = w * CoverHeight / COVER_WIDTH;
-	for (y = 0; y < CoverHeight; ++y) {
-		int sy = (h - sh) / 2 + y * sh / CoverHeight;
-		for (x = 0; x < COVER_WIDTH; ++x) {
-			int sx = (w - sw) / 2 + x * sw / COVER_WIDTH;
-			const unsigned char *p = src + 3 * ((size_t)sy * w + sx);
-			g->thumbnail[y * COVER_WIDTH + x] = p[0] << 16 | p[1] << 8 | p[2];
-		}
-	}
-	stbi_image_free(src);
-}
-
 static int columns(void)
 {
 	int n = (main_view.width - SPACING) / (COVER_WIDTH + SPACING);
@@ -127,11 +93,15 @@ static void paint(struct canvas c)
 	fill(c, 0, 0, width, height, BACKGROUND);
 	fill(c, 0, 0, width, Header, BAR_BACKGROUND);
 	text(c, SPACING, HEADER_FONT_SIZE + 6, 0, width, HEADER_FONT_SIZE, 0xffffff, "ludus");
-	for (i = first_row * cols; i < count; ++i) {
+	static int cached_begin, cached_end;
+	int begin = first_row * cols;
+	int end = begin;
+	for (i = begin; i < count; ++i) {
 		int left = SPACING + (i % cols) * (COVER_WIDTH + SPACING);
 		int top = Header + SPACING + (i / cols - first_row) * (TileHeight + SPACING);
 		int visible = width - left;
 		if (top >= bar) break;
+		end = i + 1;
 		if (visible <= 0) continue;
 		if (visible > COVER_WIDTH) visible = COVER_WIDTH;
 		if (i == selected)
@@ -147,7 +117,30 @@ static void paint(struct canvas c)
 			memcpy(c.pixels + (size_t)(top + y) * width + left,
 			       games[i].thumbnail + y * COVER_WIDTH, visible * sizeof(*c.pixels));
 	}
+	for (i = cached_begin; i < cached_end; ++i) {
+		if (i >= begin && i < end) continue;
+		free(games[i].thumbnail);
+		games[i].thumbnail = NULL;
+		games[i].tried = 0;
+	}
+	cached_begin = begin;
+	cached_end = end;
 	fill(c, 0, bar, width, Footer, BAR_BACKGROUND);
+	if (searching) {
+		const char *match = found ? games[selected].value[Name] : "No match";
+		char prompt[sizeof query + 2];
+		snprintf(prompt, sizeof prompt, "/%s", query);
+		int edge = width / 2;
+		char saved = prompt[1 + query_cursor];
+		prompt[1 + query_cursor] = 0;
+		int caret = text_width(STATUS_FONT_SIZE, prompt);
+		prompt[1 + query_cursor] = saved;
+		int start = caret + 8 < edge ? 6 : edge - caret - 2;
+		text(c, start, bar + STATUS_FONT_SIZE + 1, 6, edge, STATUS_FONT_SIZE, 0xffffff, prompt);
+		fill(c, start + caret, bar + 3, 1, STATUS_FONT_SIZE, BORDER_COLOR);
+		text(c, edge + 6, bar + STATUS_FONT_SIZE + 1, edge + 6, right, STATUS_FONT_SIZE, 0xffffff, match);
+		return;
+	}
 	text(c, 6, bar + STATUS_FONT_SIZE + 1, 0, split - 4, STATUS_FONT_SIZE, 0xffffff,
 	     count ? games[selected].value[Name] : "+ Add game");
 	if (*status)
@@ -242,8 +235,8 @@ static void save_form(void)
 		field = Exe;
 		return;
 	}
-	for (int i = Exe; i <= Proton; ++i) {
-		if (i == Runner || (i != Art && !*fields[i])) continue;
+	for (int i = Exe; i <= Prefix; ++i) {
+		if (i == Runner || !*fields[i]) continue;
 		if (*fields[i] != '/') {
 			strcpy(form_error, "Enter an absolute path.");
 			field = i;
@@ -272,24 +265,29 @@ static size_t next_char(const char *s, size_t pos)
 	return pos;
 }
 
-static void form_key(xkb_keysym_t sym, uint32_t code)
+static void insert_text(char *value, size_t *cursor_pos, const char *str)
 {
-	char *value = fields[field], typed[64];
-	size_t pos = cursor[field], len = strlen(value);
-	dialog.dirty = 1;
-	form_error[0] = 0;
+	size_t pos = *cursor_pos, len = strlen(value), n = strlen(str);
+	int chars;
+	int size;
+	if (n >= PATH_MAX - len || !FcUtf8Len((const FcChar8 *)str, (int)n, &chars, &size)) return;
+	memmove(value + pos + n, value + pos, len - pos + 1);
+	memcpy(value + pos, str, n);
+	*cursor_pos += n;
+}
+
+static void edit_line(char *value, size_t *cursor_pos, xkb_keysym_t sym, uint32_t code)
+{
+	char typed[64];
+	size_t pos = *cursor_pos, len = strlen(value);
 	switch (sym) {
-	case XKB_KEY_Escape: close_dialog(); return;
-	case XKB_KEY_Return: case XKB_KEY_KP_Enter: save_form(); return;
-	case XKB_KEY_Tab: field = (field + 1) % FieldCount; return;
-	case XKB_KEY_ISO_Left_Tab: field = (field + FieldCount - 1) % FieldCount; return;
-	case XKB_KEY_Left: cursor[field] = previous_char(value, pos); return;
-	case XKB_KEY_Right: cursor[field] = next_char(value, pos); return;
-	case XKB_KEY_Home: cursor[field] = 0; return;
-	case XKB_KEY_End: cursor[field] = len; return;
+	case XKB_KEY_Left: *cursor_pos = previous_char(value, pos); return;
+	case XKB_KEY_Right: *cursor_pos = next_char(value, pos); return;
+	case XKB_KEY_Home: *cursor_pos = 0; return;
+	case XKB_KEY_End: *cursor_pos = len; return;
 	case XKB_KEY_BackSpace:
-		cursor[field] = previous_char(value, pos);
-		memmove(value + cursor[field], value + pos, len - pos + 1);
+		*cursor_pos = previous_char(value, pos);
+		memmove(value + *cursor_pos, value + pos, len - pos + 1);
 		return;
 	case XKB_KEY_Delete: {
 		size_t next = next_char(value, pos);
@@ -298,12 +296,51 @@ static void form_key(xkb_keysym_t sym, uint32_t code)
 	}
 	}
 	int n = xkb_state_key_get_utf8(keys, code, typed, sizeof typed);
-	if (n > 0 && n < (int)sizeof typed && len + n < sizeof fields[field] &&
-	    (unsigned char)typed[0] >= 32 && typed[0] != 127) {
-		memmove(value + pos + n, value + pos, len - pos + 1);
-		memcpy(value + pos, typed, n);
-		cursor[field] += n;
+	if (n > 0 && n < (int)sizeof typed && (unsigned char)typed[0] >= 32 && typed[0] != 127)
+		insert_text(value, cursor_pos, typed);
+}
+
+static void form_key(xkb_keysym_t sym, uint32_t code)
+{
+	dialog.dirty = 1;
+	form_error[0] = 0;
+	switch (sym) {
+	case XKB_KEY_Escape: close_dialog(); return;
+	case XKB_KEY_Return: case XKB_KEY_KP_Enter: save_form(); return;
+	case XKB_KEY_Tab: field = (field + 1) % FieldCount; return;
+	case XKB_KEY_ISO_Left_Tab: field = (field + FieldCount - 1) % FieldCount; return;
 	}
+	edit_line(fields[field], &cursor[field], sym, code);
+}
+
+/* Search moves the grid selection; n/N continue from it and wrap around. */
+static int find_title(int start, int direction)
+{
+	int i = start;
+	for (int n = 0; n < count; ++n) {
+		if (i < 0) i = count - 1;
+		if (i >= count) i = 0;
+		if (FcStrStrIgnoreCase((FcChar8 *)games[i].value[Name], (FcChar8 *)query)) {
+			selected = i;
+			return 1;
+		}
+		i += direction;
+	}
+	return 0;
+}
+
+static void search_key(xkb_keysym_t sym, uint32_t code)
+{
+	main_view.dirty = 1;
+	if (sym == XKB_KEY_Escape || sym == XKB_KEY_Return || sym == XKB_KEY_KP_Enter) {
+		clipboard_cancel();
+		if (!found || sym == XKB_KEY_Escape) selected = search_origin;
+		searching = 0;
+		if (sym == XKB_KEY_Escape) query[0] = 0;
+		return;
+	}
+	edit_line(query, &query_cursor, sym, code);
+	found = find_title(search_origin, 1);
 }
 
 static void reap(void)
@@ -329,7 +366,21 @@ static void press(xkb_keysym_t sym)
 	int col = columns(), old = selected;
 	if (sym == KEY_QUIT) running = 0;
 	if (sym == KEY_ADD || sym == XKB_KEY_KP_Add) { open_dialog(-1); return; }
+	if (sym == KEY_SEARCH) {
+		search_origin = selected;
+		query[0] = 0;
+		query_cursor = 0;
+		found = count > 0;
+		searching = main_view.dirty = 1;
+		return;
+	}
 	if (!count) return;
+	if (*query && (sym == KEY_NEXT_MATCH || sym == KEY_PREV_MATCH)) {
+		int direction = sym == KEY_NEXT_MATCH ? 1 : -1;
+		find_title(selected + direction, direction);
+		main_view.dirty = 1;
+		return;
+	}
 	if (sym == KEY_EDIT) { open_dialog(selected); return; }
 	if (sym == KEY_LEFT && selected % col > 0) --selected;
 	if (sym == KEY_RIGHT && selected % col < col - 1 && selected + 1 < count) ++selected;
@@ -389,9 +440,20 @@ static void key(void *data, struct wl_keyboard *kb, uint32_t serial, uint32_t ti
 	(void)data; (void)kb; (void)serial; (void)time;
 	if (!keys || state != WL_KEYBOARD_KEY_STATE_PRESSED) return;
 	xkb_keysym_t sym = xkb_state_key_get_one_sym(keys, code + 8);
+	int in_form = dialog.surface && focus == dialog.surface;
+	if ((in_form || (searching && focus == main_view.surface)) &&
+	    ((sym == XKB_KEY_v && xkb_state_mod_name_is_active(keys, XKB_MOD_NAME_CTRL, XKB_STATE_MODS_EFFECTIVE) > 0) ||
+	     (sym == XKB_KEY_Insert && xkb_state_mod_name_is_active(keys, XKB_MOD_NAME_SHIFT, XKB_STATE_MODS_EFFECTIVE) > 0))) {
+		paste_target = in_form ? (int)field : FieldCount;
+		clipboard_receive();
+		return;
+	}
 	if (dialog.surface) {
 		if (focus == dialog.surface) form_key(sym, code + 8);
-	} else if (focus == main_view.surface) press(sym);
+	} else if (focus == main_view.surface) {
+		if (searching) search_key(sym, code + 8);
+		else press(sym);
+	}
 }
 static void enter(void *d, struct wl_keyboard *k, uint32_t s, struct wl_surface *w, struct wl_array *a)
 { (void)d; (void)k; (void)s; focus = w; (void)a; }
@@ -428,9 +490,12 @@ static void global(void *data, struct wl_registry *r, uint32_t id, const char *n
 	else if (!strcmp(name, "xdg_wm_base")) {
 		wm = wl_registry_bind(r, id, &xdg_wm_base_interface, 1);
 		xdg_wm_base_add_listener(wm, &wm_events, NULL);
+	} else if (!strcmp(name, "wl_data_device_manager")) {
+		clipboard_bind(r, id);
 	} else if (!seat && !strcmp(name, "wl_seat")) {
 		seat = wl_registry_bind(r, id, &wl_seat_interface, 1);
 		seat_name = id;
+		clipboard_seat(seat);
 		wl_seat_add_listener(seat, &seat_events, NULL);
 	}
 }
@@ -439,6 +504,7 @@ static void removed(void *data, struct wl_registry *r, uint32_t id)
 	(void)data; (void)r;
 	if (seat && id == seat_name) {
 		capabilities(NULL, seat, 0);
+		clipboard_seat(NULL);
 		wl_seat_destroy(seat);
 		seat = NULL;
 	}
@@ -513,7 +579,7 @@ static void open_dialog(int index)
 			if (strlen(g->value[i]) >= sizeof fields[i] || strchr(g->value[i], '\n')) goto uneditable;
 			strcpy(fields[i], g->value[i]);
 		}
-		if (fields[Art][0] != '/') {
+		if (*fields[Art] && fields[Art][0] != '/') {
 			char cwd[PATH_MAX];
 			if (!getcwd(cwd, sizeof cwd) ||
 			    snprintf(fields[Art], PATH_MAX, "%s/%s", cwd, g->value[Art]) >= PATH_MAX)
@@ -539,6 +605,7 @@ uneditable:
 
 static void close_dialog(void)
 {
+	clipboard_cancel();
 	if (focus == dialog.surface) focus = NULL;
 	xdg_toplevel_destroy(dialog.window);
 	xdg_surface_destroy(dialog.shell);
@@ -550,24 +617,36 @@ static void close_dialog(void)
 
 static void event_loop(void)
 {
-	struct pollfd fd = { .fd = wl_display_get_fd(display) };
+	struct pollfd fds[2] = {{.fd = wl_display_get_fd(display)}, {.events = POLLIN}};
 	while (running) {
 		if (wl_display_dispatch_pending(display) < 0) die("Wayland connection lost");
 		if (!running) break;
 		if (active) reap();
 		redraw(&main_view);
 		redraw(&dialog);
-		fd.events = POLLIN;
+		fds[0].events = POLLIN;
 		if (wl_display_flush(display) < 0) {
 			if (errno != EAGAIN) die("Wayland connection lost");
-			fd.events |= POLLOUT;
+			fds[0].events |= POLLOUT;
 		}
-		if (poll(&fd, 1, active ? 150 : -1) < 0) {
+		fds[1].fd = clipboard_fd();
+		if (poll(fds, 2, active ? 150 : -1) < 0) {
 			if (errno == EINTR) continue;
 			die(strerror(errno));
 		}
-		if (fd.revents & (POLLERR | POLLHUP | POLLNVAL)) die("Wayland connection lost");
-		if ((fd.revents & POLLIN) && wl_display_dispatch(display) < 0) die("Wayland connection lost");
+		if (fds[1].revents) {
+			const char *s = clipboard_read();
+			if (s && paste_target == FieldCount && searching) {
+				insert_text(query, &query_cursor, s);
+				found = find_title(search_origin, 1);
+				main_view.dirty = 1;
+			} else if (s && dialog.surface && paste_target < FieldCount) {
+				insert_text(fields[paste_target], &cursor[paste_target], s);
+				dialog.dirty = 1;
+			}
+		}
+		if (fds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) die("Wayland connection lost");
+		if ((fds[0].revents & POLLIN) && wl_display_dispatch(display) < 0) die("Wayland connection lost");
 	}
 }
 

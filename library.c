@@ -33,6 +33,9 @@ int library_append(char *const values[FieldCount])
 }
 
 static char dir[PATH_MAX];
+static const char *const keys[FieldCount] = {
+	"name", "exe", "art", "runner", "WINEPREFIX", "PROTONPATH", "cmd"
+};
 
 static int join(char *dst, const char *a, const char *b)
 {
@@ -45,8 +48,8 @@ static int join(char *dst, const char *a, const char *b)
 
 static int valid(char *const v[FieldCount])
 {
-	return *v[Name] && (v[Exe][0] == '/' || (!*v[Exe] && *v[Launch])) && v[Art][0] == '/' &&
-	       (!*v[Prefix] || v[Prefix][0] == '/') && (!*v[Proton] || v[Proton][0] == '/');
+	return *v[Name] && (v[Exe][0] == '/' || (!*v[Exe] && *v[Launch])) && (!*v[Art] || v[Art][0] == '/') &&
+	       (!*v[Prefix] || v[Prefix][0] == '/');
 }
 
 /* Keep titles readable while encoding filename separators and literal escapes. */
@@ -60,12 +63,12 @@ static int game_path(char *dest, const char *name)
 		if (*p == '%') escape = "%25";
 		if (p == name && *p == '.') escape = "%2E";
 		size_t bytes = escape ? 3 : 1;
-		if (n + bytes + sizeof ".conf" > sizeof file) { errno = ENAMETOOLONG; return -1; }
+		if (n + bytes + sizeof ".meta" > sizeof file) { errno = ENAMETOOLONG; return -1; }
 		if (escape) memcpy(file + n, escape, bytes);
 		else file[n] = *p;
 		n += bytes;
 	}
-	strcpy(file + n, ".conf");
+	strcpy(file + n, ".meta");
 	return join(dest, dir, file);
 }
 
@@ -83,7 +86,7 @@ static int write_game(const char *dest, const char *existing, char *const values
 	if (!f) { error = errno; close(fd); }
 	else {
 		for (int i = 0; i < FieldCount; ++i)
-			if (fprintf(f, "%s\n", values[i]) < 0) { error = errno; break; }
+			if (fprintf(f, "%s=%s\n", keys[i], values[i]) < 0) { error = errno; break; }
 		if (fclose(f)) error = errno;
 	}
 	if (!error && existing && !strcmp(existing, dest)) {
@@ -101,12 +104,33 @@ static int write_game(const char *dest, const char *existing, char *const values
 	return 0;
 }
 
-static void read_game(const char *path, int legacy)
+static int read_meta(FILE *f, char **values)
 {
-	char dest[PATH_MAX], *values[FieldCount] = {0};
-	FILE *f = fopen(path, "r");
+	char *line = NULL;
+	size_t cap = 0;
+	ssize_t n;
+	int ok = 1;
+	while ((n = getline(&line, &cap, f)) >= 0) {
+		if (memchr(line, 0, n)) { ok = 0; break; }
+		while (n && (line[n-1] == '\n' || line[n-1] == '\r')) line[--n] = 0;
+		if (!n || line[0] == '#') continue;
+		char *value = strchr(line, '=');
+		if (!value) { ok = 0; break; }
+		*value++ = 0;
+		int i = 0;
+		while (i < FieldCount && strcmp(keys[i], line)) ++i;
+		if (i == FieldCount || values[i]) { ok = 0; break; }
+		values[i] = copy(value);
+	}
+	free(line);
+	for (int i = 0; i < FieldCount; ++i)
+		if (!values[i]) values[i] = copy("");
+	return ok && !ferror(f);
+}
+
+static int read_positional(FILE *f, char **values)
+{
 	int i;
-	if (!f) { perror(path); return; }
 	for (i = 0; i < FieldCount; ++i) {
 		size_t cap = 0;
 		ssize_t n = getline(&values[i], &cap, f);
@@ -120,7 +144,17 @@ static void read_game(const char *path, int legacy)
 		if (n < 1 || values[i][n-1] != '\n' || memchr(values[i], 0, n)) break;
 		values[i][n-1] = 0;
 	}
-	if (i == FieldCount && valid(values)) {
+	return i == FieldCount;
+}
+
+static void read_game(const char *path, int legacy)
+{
+	char dest[PATH_MAX], *values[FieldCount] = {0};
+	FILE *f = fopen(path, "r");
+	int i;
+	if (!f) { perror(path); return; }
+	int parsed = legacy ? read_positional(f, values) : read_meta(f, values);
+	if (parsed && valid(values)) {
 		int index = library_append(values);
 		if (legacy) {
 			if (game_path(dest, values[Name]) || write_game(dest, path, values))
@@ -142,10 +176,11 @@ static void scan_games(const char *directory, int legacy)
 		char path[PATH_MAX];
 		const char *name = entries[i]->d_name;
 		size_t len = strlen(name);
-		int match = legacy ? !strncmp(name, "game-", 5) : len > 5 && !strcmp(name + len - 5, ".conf");
+		int positional = legacy || (len > 5 && !strcmp(name + len - 5, ".conf"));
+		int match = legacy ? !strncmp(name, "game-", 5) : positional || (len > 5 && !strcmp(name + len - 5, ".meta"));
 		if (match && !join(path, directory, name)) {
 			struct stat st;
-			if (!lstat(path, &st) && S_ISREG(st.st_mode)) read_game(path, legacy);
+			if (!lstat(path, &st) && S_ISREG(st.st_mode)) read_game(path, positional);
 		}
 		free(entries[i]);
 	}

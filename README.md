@@ -24,9 +24,15 @@ when it fits. The header defaults to 32 px and the status bar to 16 px.
 Press `+` to add a game or `e` to edit the selected game. Enter saves the
 entry and Escape discards the edits. Tab and Shift+Tab switch fields. Use
 Left, Right, Home, and End to move the text cursor, and Backspace or Delete
-to remove a character.
+to remove a character. Ctrl+V or Shift+Insert pastes the first line of the
+Wayland clipboard at the cursor. The same bindings work in title search.
 
-Enter a name and an absolute JPEG or PNG artwork path. For a direct launch,
+Press `/` in the grid and type part of a title. Selection moves to the first
+case-insensitive match starting at the current game. Enter keeps the selection;
+Escape restores the original one. Use `n` and `N` for the next and previous
+matches, wrapping around the library.
+
+Enter a name. Artwork is optional and takes an absolute JPEG or PNG path. For a direct launch,
 enter the game's absolute executable path. The runner starts blank. Set it
 to a program on PATH or an absolute path to run the executable with that
 program, for example `wine`, `umu-run`, or `/bin/sh`. Set WINEPREFIX or
@@ -39,18 +45,31 @@ For example, `exec "$@" -novid` adds a game option and
 and runner empty and enter a complete command such as `exec steam -applaunch 620`.
 
 Each game has a plain-text file named after its title, such as
-`~/.ludus/Black Mesa.conf`. Renaming the game in the editor renames its file.
+`~/.ludus/Black Mesa.meta`. Renaming the game in the editor renames its file.
 Titles must have distinct filenames. Spaces and Unicode are preserved. In
 filenames, `/`, `%`, and a leading dot are encoded as `%2F`, `%25`, and `%2E`.
 
-On startup, Ludus moves valid entries from the previous
-`$XDG_DATA_HOME/ludus/games/` directory (default `~/.local/share/ludus/games/`).
-If a destination already exists, the old entry stays available under its old
-path. Give that entry a distinct title with `e` to finish moving it.
+Metadata is UTF-8 with one `key=value` per line, in any order. Start a line
+with `#` for a comment. Values are literal text, including spaces and any
+additional equals signs. Only `cmd` is interpreted by a shell at launch.
+Specify `name` and either `exe` or `cmd`. Other keys can be blank or omitted.
+Here is an example using all seven keys:
 
-The seven lines in a config file are the name, executable, artwork, runner,
-WINEPREFIX, PROTONPATH, and launch command, in that order. Keep a blank line
-for each unused field.
+```ini
+name=Black Mesa
+exe=/games/Black Mesa/bms.exe
+art=/pictures/Black Mesa.jpg
+runner=umu-run
+WINEPREFIX=/games/prefixes/black-mesa
+PROTONPATH=GE-Proton
+cmd=
+```
+
+Ludus migrates positional `.conf` files in `~/.ludus/` and old `game-*`
+entries in `$XDG_DATA_HOME/ludus/games/` (default `~/.local/share/ludus/games/`).
+If a destination already exists, the old entry stays available at its original
+path. Give it a distinct title with `e` to finish moving it.
+
 The bottom bar follows the
 launched process: it shows “Playing” at launch and “Stopped” when that
 process exits. A runner that detaches from its game can exit earlier.
@@ -70,7 +89,10 @@ boundaries intact and inherit the launcher's environment and working directory.
 
 The bundled stb_image decoder reads JPEG and PNG files as they come into view.
 The grid center-crops each image to a 2:3 thumbnail. A 600×900 cover fits
-without cropping. An unreadable cover produces a placeholder and a diagnostic
-on standard error.
+without cropping. Thumbnails are cached in `~/.ludus/cache/` and reused across
+launches. Changing the source image or cover size causes regeneration.
+Offscreen thumbnails are released from memory. You can delete the cache and
+Ludus will rebuild it from your originals. An empty or unreadable artwork
+path shows a placeholder.
 
 `vendor/stb_image.h` comes from stb revision `5c20573` and includes its license.

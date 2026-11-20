@@ -50,12 +50,15 @@ Ludus passes the file to `oyna --config` when you press Enter.
 See the [oyna config docs](https://github.com/gunesemir/oyna#config-files).
 
 Press `+` to open a new config template. Fill it in and save it under your
-game's title in `~/.oyna/`. Press `e` to edit an existing config. The grid
-refreshes when the editor exits.
+game's title in `~/.oyna/`. Press `e` to edit an existing config. Ludus hides
+the grid while you edit and restores it when the editor exits.
 
-Set `EDITOR` to a command that waits until you're done editing, such as
-`code --wait`. For a terminal editor, start Ludus from a terminal or use
-an editor command that opens one, such as `EDITOR='foot nvim'`.
+Set `EDITOR` to your editor, for example `EDITOR=nvim`. Ludus uses its
+foreground terminal if it has one. Otherwise it uses `xdg-terminal-exec`
+or the command in `TERMINAL` if set. Include any flags your terminal needs
+to run a command and wait for it to finish, for example
+`TERMINAL='alacritty -e'`. Editors that detach need a wait flag, such as
+`EDITOR='code --wait'`.
 
 A 600×900 cover fits the grid. Thumbnails are cached in `~/.cache/ludus/`.
 

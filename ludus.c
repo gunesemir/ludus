@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <poll.h>
 #include <signal.h>
@@ -11,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <termios.h>
 #include <unistd.h>
 
 #include <wayland-client.h>
@@ -56,6 +58,10 @@ static size_t query_cursor;
 static int submit_after_paste;
 extern char **environ;
 static pid_t editor_pid;
+static int editor_tty = -1;
+static struct termios editor_termios;
+static const int editor_signals[] = {SIGINT, SIGQUIT};
+static struct sigaction editor_handlers[sizeof editor_signals / sizeof *editor_signals];
 static char editor_draft[PATH_MAX];
 static struct stat draft_revision;
 static struct wl_display *display;
@@ -69,6 +75,8 @@ static struct xkb_context *xkb;
 static struct xkb_state *keys;
 static int repeat_fd, repeat_rate = 25, repeat_delay = 600;
 static uint32_t repeat_code;
+
+static void show_view(void);
 
 static void stop_repeat(void)
 {
@@ -176,7 +184,7 @@ static void destroy_view(struct view *v)
 	wl_surface_destroy(v->surface);
 	for (size_t i = 0; i < 2; ++i)
 		if (v->frames[i]) released(v->frames[i], v->frames[i]->buffer);
-	*v = (struct view){0};
+	*v = (struct view){ .width = v->width, .height = v->height };
 }
 
 static void redraw(struct view *v)
@@ -296,6 +304,56 @@ static void search_key(xkb_keysym_t sym, uint32_t code)
 	found = find_title(search_origin, 1);
 }
 
+static void ignore_terminal_signal(int sig)
+{
+	(void)sig;
+}
+
+static void restore_editor_signals(size_t count)
+{
+	while (count) {
+		--count;
+		sigaction(editor_signals[count], &editor_handlers[count], NULL);
+	}
+}
+
+static int spawn_tty_editor(int tty, char **args)
+{
+	posix_spawn_file_actions_t io;
+	int error = posix_spawn_file_actions_init(&io);
+	if (error) return error;
+	for (int fd = STDIN_FILENO; !error && fd <= STDERR_FILENO; ++fd)
+		error = posix_spawn_file_actions_adddup2(&io, tty, fd);
+
+	/* The shell and editor get default dispositions for these caught signals. */
+	struct sigaction action = { .sa_handler = ignore_terminal_signal };
+	sigemptyset(&action.sa_mask);
+	size_t count = 0;
+	while (!error && count < sizeof editor_signals / sizeof *editor_signals) {
+		if (sigaction(editor_signals[count], &action, &editor_handlers[count])) error = errno;
+		else ++count;
+	}
+	if (!error) error = posix_spawn(&editor_pid, args[0], &io, NULL, args, environ);
+	posix_spawn_file_actions_destroy(&io);
+	if (error) restore_editor_signals(count);
+	return error;
+}
+
+static int spawn_terminal(char *command, const char *path)
+{
+	const char *terminal = getenv("TERMINAL");
+	if (terminal && *terminal) {
+		char wrapper[PATH_MAX];
+		if (snprintf(wrapper, sizeof wrapper, "exec %s \"$@\"", terminal) >= (int)sizeof wrapper)
+			return ENAMETOOLONG;
+		char *args[] = {"/bin/sh", "-c", wrapper, "ludus-terminal",
+		                "/bin/sh", "-c", command, "ludus-editor", (char *)path, NULL};
+		return posix_spawn(&editor_pid, args[0], NULL, NULL, args, environ);
+	}
+	char *args[] = {"xdg-terminal-exec", "/bin/sh", "-c", command, "ludus-editor", (char *)path, NULL};
+	return posix_spawnp(&editor_pid, args[0], NULL, NULL, args, environ);
+}
+
 static void start_editor(const char *path)
 {
 	if (editor_pid) return;
@@ -319,21 +377,46 @@ static void start_editor(const char *path)
 		}
 		path = editor_draft;
 	}
-	char *args[] = {"sh", "-c", command, "ludus-editor", (char *)path, NULL};
-	int error = posix_spawn(&editor_pid, "/bin/sh", NULL, NULL, args, environ);
+	stop_repeat();
+	clipboard_cancel();
+	focus = NULL;
+	destroy_view(&main_view);
+	wl_display_flush(display);
+
+	char *args[] = {"/bin/sh", "-c", command, "ludus-editor", (char *)path, NULL};
+	int tty = open("/dev/tty", O_RDWR | O_CLOEXEC);
+	if (tty >= 0 && (tcgetpgrp(tty) != getpgrp() || tcgetattr(tty, &editor_termios))) {
+		close(tty);
+		tty = -1;
+	}
+	int error = tty >= 0 ? spawn_tty_editor(tty, args) : spawn_terminal(command, path);
 	if (error) {
+		if (tty >= 0) close(tty);
 		if (*editor_draft) library_discard_draft(editor_draft, &draft_revision);
 		editor_draft[0] = 0;
 		editor_pid = 0;
-		snprintf(status, sizeof status, "Cannot start editor: %s", strerror(error));
+		if (tty < 0 && error == ENOENT)
+			strcpy(status, "Set TERMINAL or install xdg-terminal-exec");
+		else
+			snprintf(status, sizeof status, "Cannot start %s: %s",
+			         tty >= 0 ? "editor" : "terminal", strerror(error));
+		show_view();
 		return;
 	}
-	strcpy(status, "Editor open");
+	editor_tty = tty;
+	status[0] = 0;
 }
 
 static void editor_finished(int result)
 {
 	editor_pid = 0;
+	if (editor_tty >= 0) {
+		if (tcgetpgrp(editor_tty) == getpgrp())
+			tcsetattr(editor_tty, TCSANOW, &editor_termios);
+		close(editor_tty);
+		editor_tty = -1;
+		restore_editor_signals(sizeof editor_signals / sizeof *editor_signals);
+	}
 	if (*editor_draft) library_discard_draft(editor_draft, &draft_revision);
 	selected = library_load(selected, editor_draft);
 	editor_draft[0] = 0;
@@ -345,8 +428,7 @@ static void editor_finished(int result)
 		snprintf(status, sizeof status, "Editor stopped (signal %d)", WTERMSIG(result));
 	else if (WIFEXITED(result) && WEXITSTATUS(result))
 		snprintf(status, sizeof status, "Editor exited (%d)", WEXITSTATUS(result));
-	else if (!strcmp(status, "Editor open")) status[0] = 0;
-	main_view.dirty = 1;
+	show_view();
 }
 
 static void reap(void)
@@ -447,7 +529,7 @@ static int paste_shortcut(xkb_keysym_t sym)
 static int handle_press(uint32_t code)
 {
 	xkb_keysym_t sym = xkb_state_key_get_one_sym(keys, code);
-	if (focus != main_view.surface) return 0;
+	if (!main_view.surface || focus != main_view.surface) return 0;
 	if (searching) {
 		int submit = sym == XKB_KEY_Return || sym == XKB_KEY_KP_Enter;
 		if (submit && clipboard_fd() >= 0) {
@@ -581,15 +663,19 @@ static void closed(void *data, struct xdg_toplevel *t)
 { (void)t; (void)data; running = 0; }
 static const struct xdg_toplevel_listener window_events = { .configure = resize, .close = closed };
 
-static void create_view(struct view *v, const char *title)
+static void show_view(void)
 {
+	struct view *v = &main_view;
 	v->surface = wl_compositor_create_surface(compositor);
 	v->shell = xdg_wm_base_get_xdg_surface(wm, v->surface);
 	xdg_surface_add_listener(v->shell, &surface_events, v);
 	v->window = xdg_surface_get_toplevel(v->shell);
 	xdg_toplevel_add_listener(v->window, &window_events, v);
-	xdg_toplevel_set_title(v->window, title);
+	xdg_toplevel_set_title(v->window, "ludus");
 	xdg_toplevel_set_app_id(v->window, "ludus");
+	xdg_toplevel_set_min_size(v->window, COVER_WIDTH + 2 * SPACING,
+	                          Header + Footer + TileHeight + 2 * SPACING);
+	wl_surface_commit(v->surface);
 }
 
 static void finish_paste(void)
@@ -656,12 +742,9 @@ int main(void)
 	wl_registry_add_listener(registry, &registry_events, NULL);
 	if (wl_display_roundtrip(display) < 0) die("cannot read Wayland registry");
 	if (!compositor || !shm || !wm) die("compositor lacks wl_compositor, wl_shm or xdg-shell");
-	create_view(&main_view, "ludus");
-	xdg_toplevel_set_min_size(main_view.window, COVER_WIDTH + 2 * SPACING,
-	                          Header + Footer + TileHeight + 2 * SPACING);
-	wl_surface_commit(main_view.surface);
+	show_view();
 	event_loop();
-	destroy_view(&main_view);
+	if (main_view.surface) destroy_view(&main_view);
 	clipboard_finish();
 	if (seat) {
 		capabilities(NULL, seat, 0);

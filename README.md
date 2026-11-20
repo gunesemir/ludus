@@ -59,4 +59,5 @@ an editor command that opens one, such as `EDITOR='foot nvim'`.
 
 A 600×900 cover fits the grid. Thumbnails are cached in `~/.cache/ludus/`.
 
-The bundled `stb_image.h` (revision `5c20573`) includes its license.
+Ludus is licensed under [0BSD](LICENSE). The bundled `stb_image.h`
+(revision `5c20573`) includes its license.

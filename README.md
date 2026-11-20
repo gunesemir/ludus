@@ -39,7 +39,30 @@ at the cursor. Enter saves your changes and Escape cancels.
 | Next or previous match | `n` / `N` |
 | Quit | `q` |
 
-## Game files
+## Oyna games
+
+Put your oyna config in `~/.ludus/` and use the game title as the filename.
+For example, save this as `~/.ludus/Black Mesa`:
+
+```ini
+exe=/games/Black Mesa/bms.exe
+WINEPREFIX=/games/prefixes/black-mesa
+PROTONPATH=/games/proton/GE-Proton
+arg=-novid
+art=/pictures/Black Mesa.jpg
+```
+
+Put `oyna` on your `PATH`. Ludus uses the filename as the title, reads
+`art=` if present, and passes the file to `oyna --config` when you press Enter.
+Press `e` to rename the file or change its cover. Edit the runner settings
+and arguments in the file itself.
+
+To create one with `+`, enter `oyna` as the runner and give the executable,
+prefix, and Proton installation as absolute paths. Leave Working directory
+and Launch command blank. Oyna expects the game, prefix, and Proton paths
+to exist.
+
+## Other game files
 
 You can also edit games by hand. Each one has a file in `~/.ludus/`, with one
 `key=value` per line. Only `name` and either `exe` or `cmd` are required.

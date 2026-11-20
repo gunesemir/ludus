@@ -31,8 +31,7 @@ enum {
 	TileHeight = CoverHeight + 6 + TitleLines * (FONT_SIZE + 3),
 	Header = HEADER_FONT_SIZE + 20,
 	Footer = STATUS_FONT_SIZE + 6,
-	Row = FONT_SIZE * 2 + 12,
-	DialogHeight = FieldCount * Row + 8
+	Row = FONT_SIZE * 2 + 12
 };
 struct view {
 	struct wl_surface *surface;
@@ -57,7 +56,8 @@ static size_t query_cursor;
 static int submit_after_paste;
 static enum field field;
 static size_t cursor[FieldCount];
-static int editing;
+static int editing, dialog_oyna;
+static const int oyna_fields[] = {Name, Art};
 static const char *labels[] = {"Name", "Executable", "Working directory", "Artwork", "Runner", "Prefix", "Wine/Proton version", "Launch command"};
 static void open_dialog(int index);
 static void close_dialog(void);
@@ -165,10 +165,12 @@ static void paint(struct canvas c)
 static void paint_dialog(struct canvas c)
 {
 	int left = 14, right = c.width - 14;
-	int step = (c.height - 8) / FieldCount;
+	int rows = dialog_oyna ? 2 : FieldCount;
+	int step = (c.height - 8) / rows;
 	fill(c, 0, 0, c.width, c.height, BAR_BACKGROUND);
-	for (int i = 0; i < FieldCount; ++i) {
-		int y = 4 + i * step, start = left + 5;
+	for (int row = 0; row < rows; ++row) {
+		int i = dialog_oyna ? oyna_fields[row] : row;
+		int y = 4 + row * step, start = left + 5;
 		int input_y = y + FONT_SIZE + 2;
 		int available = right - start - 5, offset = 0;
 		int focused = i == (int)field;
@@ -256,17 +258,19 @@ static void save_form(void)
 		field = Name;
 		return;
 	}
-	if (!*fields[Exe] && !*fields[Launch]) {
-		strcpy(form_error, "Enter a path or a launch command.");
-		field = Exe;
-		return;
-	}
-	for (int i = Exe; i <= Prefix; ++i) {
-		if (i == Runner || !*fields[i]) continue;
-		if (*fields[i] != '/') {
-			strcpy(form_error, "Enter an absolute path.");
-			field = i;
+	if (!dialog_oyna) {
+		if (!*fields[Exe] && !*fields[Launch]) {
+			strcpy(form_error, "Enter a path or a launch command.");
+			field = Exe;
 			return;
+		}
+		for (int i = Exe; i <= Prefix; ++i) {
+			if (i == Runner || !*fields[i]) continue;
+			if (*fields[i] != '/') {
+				strcpy(form_error, "Enter an absolute path.");
+				field = i;
+				return;
+			}
 		}
 	}
 	int result = library_save(editing, values);
@@ -275,6 +279,9 @@ static void save_form(void)
 		strcpy(form_error, "A config with this name already exists.");
 	} else if (result < 0 && errno == ESTALE) {
 		strcpy(form_error, "File changed. Esc, then reopen to reload.");
+	} else if (result < 0 && errno == EINVAL) {
+		field = Name;
+		strcpy(form_error, "Use a filename without / or a leading dot.");
 	} else if (result < 0) snprintf(form_error, sizeof form_error, "Save failed: %s", strerror(errno));
 	else { selected = result; close_dialog(); }
 }
@@ -336,8 +343,10 @@ static void form_key(xkb_keysym_t sym, uint32_t code)
 	switch (sym) {
 	case XKB_KEY_Escape: close_dialog(); return;
 	case XKB_KEY_Return: case XKB_KEY_KP_Enter: save_form(); return;
-	case XKB_KEY_Tab: field = (field + 1) % FieldCount; return;
-	case XKB_KEY_ISO_Left_Tab: field = (field + FieldCount - 1) % FieldCount; return;
+	case XKB_KEY_Tab: case XKB_KEY_ISO_Left_Tab:
+		if (dialog_oyna) field = field == Name ? Art : Name;
+		else field = (field + (sym == XKB_KEY_Tab ? 1 : FieldCount - 1)) % FieldCount;
+		return;
 	}
 	edit_line(fields[field], &cursor[field], sym, code);
 }
@@ -655,6 +664,7 @@ static int command_text(char **argv)
 static void open_dialog(int index)
 {
 	editing = index;
+	dialog_oyna = 0;
 	memset(fields, 0, sizeof fields);
 	if (index >= 0) {
 		struct game *g = &games[index];
@@ -663,11 +673,13 @@ static void open_dialog(int index)
 			main_view.dirty = 1;
 			return;
 		}
+		dialog_oyna = g->oyna;
 		for (int i = 0; i < FieldCount; ++i) {
+			if (dialog_oyna && i != Name && i != Art) continue;
 			if (strlen(g->value[i]) >= sizeof fields[i] || strchr(g->value[i], '\n')) goto uneditable;
 			strcpy(fields[i], g->value[i]);
 		}
-		if (*fields[Art] && fields[Art][0] != '/') {
+		if (!dialog_oyna && *fields[Art] && fields[Art][0] != '/') {
 			char cwd[PATH_MAX];
 			if (!getcwd(cwd, sizeof cwd) ||
 			    snprintf(fields[Art], PATH_MAX, "%s/%s", cwd, g->value[Art]) >= PATH_MAX)
@@ -682,11 +694,12 @@ static void open_dialog(int index)
 	field = Name;
 	form_error[0] = 0;
 	dialog.width = 520;
-	dialog.height = DialogHeight;
+	int height = (dialog_oyna ? 2 : FieldCount) * Row + 8;
+	dialog.height = height;
 	create_view(&dialog, index < 0 ? "Add game" : "Edit game");
 	xdg_toplevel_set_parent(dialog.window, main_view.window);
-	xdg_toplevel_set_min_size(dialog.window, 420, DialogHeight);
-	xdg_toplevel_set_max_size(dialog.window, 520, DialogHeight);
+	xdg_toplevel_set_min_size(dialog.window, 420, height);
+	xdg_toplevel_set_max_size(dialog.window, 520, height);
 	wl_surface_commit(dialog.surface);
 	return;
 uneditable:

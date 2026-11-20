@@ -13,6 +13,7 @@ struct game {
 	uint32_t *thumbnail;
 	pid_t pid;
 	int tried;
+	int oyna;
 };
 extern struct game *games;
 extern int count;

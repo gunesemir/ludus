@@ -26,16 +26,17 @@ size, or keybindings, edit `config.h` and run `make` again.
 | --- | --- |
 | Move left, down, up, right | `h`, `j`, `k`, `l` |
 | Launch the selected game | Enter |
-| Edit the title or cover | `e` |
+| Edit the selected config in `$EDITOR` | `e` |
+| Add a game config in `$EDITOR` | `+` |
 | Search by title | `/` |
 | Next or previous match | `n` / `N` |
 | Quit | `q` |
 
 ## Oyna games
 
-Put `oyna` on your `PATH`, then put your game configs in `~/.ludus/`.
+Put `oyna` on your `PATH`, then put your game configs in `~/.oyna/`.
 Use the game title as the filename. For example, save this as
-`~/.ludus/Black Mesa` with `art=` pointing to an optional JPEG or PNG cover.
+`~/.oyna/Black Mesa` with `art=` pointing to an optional JPEG or PNG cover.
 
 ```ini
 exe=/games/Black Mesa/bms.exe
@@ -45,12 +46,17 @@ arg=-novid
 art=/pictures/Black Mesa.jpg
 ```
 
-Ludus passes the file to `oyna --config` when you press Enter. Edit launch
-settings and arguments in the file itself. Old `.meta` entries are skipped.
+Ludus passes the file to `oyna --config` when you press Enter.
 See the [oyna config docs](https://github.com/gunesemir/oyna#config-files).
 
-Press `e` to rename the file or change its cover. Use Tab to switch fields,
-Ctrl+V or Shift+Insert to paste, Enter to save, or Escape to cancel. A 600×900
-cover fits the grid. Thumbnails are cached in `~/.ludus/cache/`.
+Press `+` to open a new config template. Fill it in and save it under your
+game's title in `~/.oyna/`. Press `e` to edit an existing config. The grid
+refreshes when the editor exits.
+
+Set `EDITOR` to a command that waits until you're done editing, such as
+`code --wait`. For a terminal editor, start Ludus from a terminal or use
+an editor command that opens one, such as `EDITOR='foot nvim'`.
+
+A 600×900 cover fits the grid. Thumbnails are cached in `~/.cache/ludus/`.
 
 The bundled `stb_image.h` (revision `5c20573`) includes its license.

@@ -3,6 +3,7 @@
 #include <limits.h>
 #include <poll.h>
 #include <signal.h>
+#include <spawn.h>
 #include <sys/timerfd.h>
 #include <sys/wait.h>
 #include <stdint.h>
@@ -25,15 +26,12 @@
 #error "Use a cover width of 2..4096 and spacing of 4..1024."
 #endif
 
-enum field { Name, Art, FieldCount };
 enum {
 	CoverHeight = COVER_WIDTH * 3 / 2,
 	TitleLines = 3,
 	TileHeight = CoverHeight + 6 + TitleLines * (FONT_SIZE + 3),
 	Header = HEADER_FONT_SIZE + 20,
-	Footer = STATUS_FONT_SIZE + 6,
-	Row = FONT_SIZE * 2 + 12,
-	DialogHeight = FieldCount * Row + 8
+	Footer = STATUS_FONT_SIZE + 6
 };
 struct view {
 	struct wl_surface *surface;
@@ -48,20 +46,18 @@ struct frame {
 	size_t bytes;
 	struct frame **slot;
 };
-static struct view main_view = { .width = 900, .height = 640 }, dialog;
+static struct view main_view = { .width = 900, .height = 640 };
 static struct wl_surface *focus;
 static int selected, first_row, running = 1, active;
-static char fields[FieldCount][PATH_MAX], form_error[256], status[PATH_MAX + 128];
-static int searching, search_origin, found, paste_target;
+static char status[PATH_MAX + 128];
+static int searching, search_origin, found;
 static char query[PATH_MAX];
 static size_t query_cursor;
 static int submit_after_paste;
-static enum field field;
-static size_t cursor[FieldCount];
-static struct game *editing;
-static const char *labels[] = {"Name", "Artwork"};
-static void open_dialog(struct game *g);
-static void close_dialog(void);
+extern char **environ;
+static pid_t editor_pid;
+static char editor_draft[PATH_MAX];
+static struct stat draft_revision;
 static struct wl_display *display;
 static struct wl_compositor *compositor;
 static struct wl_shm *shm;
@@ -132,7 +128,7 @@ static void paint(struct canvas c)
 			memcpy(c.pixels + (size_t)(top + y) * width + left,
 			       games[i].thumbnail + y * COVER_WIDTH, visible * sizeof(*c.pixels));
 	}
-	for (i = cached_begin; i < cached_end; ++i) {
+	for (i = cached_begin; i < cached_end && i < count; ++i) {
 		if (i >= begin && i < end) continue;
 		free(games[i].thumbnail);
 		games[i].thumbnail = NULL;
@@ -157,37 +153,10 @@ static void paint(struct canvas c)
 		return;
 	}
 	text(c, 6, bar + STATUS_FONT_SIZE + 1, 0, split - 4, STATUS_FONT_SIZE, 0xffffff,
-	     count ? games[selected].name : "Put oyna configs in ~/.ludus/");
+	     count ? games[selected].name : "Press + to add a game");
 	if (*status)
 		text(c, status_x, bar + STATUS_FONT_SIZE + 1, split, right, STATUS_FONT_SIZE, 0xffffff, status);
 
-}
-
-static void paint_dialog(struct canvas c)
-{
-	int left = 14, right = c.width - 14;
-	int step = (c.height - 8) / FieldCount;
-	fill(c, 0, 0, c.width, c.height, BAR_BACKGROUND);
-	for (int i = 0; i < FieldCount; ++i) {
-		int y = 4 + i * step, start = left + 5;
-		int input_y = y + FONT_SIZE + 2;
-		int available = right - start - 5, offset = 0;
-		int focused = i == (int)field;
-		fill(c, left, input_y, right - left, step - FONT_SIZE - 4, focused ? BORDER_COLOR : 0x555555);
-		fill(c, left + 1, input_y + 1, right - left - 2, step - FONT_SIZE - 6, 0);
-		text(c, left, y + FONT_SIZE - 1, left, right, FONT_SIZE, 0xffffff, labels[i]);
-		if (focused) {
-			char saved = fields[i][cursor[i]];
-			fields[i][cursor[i]] = 0;
-			offset = text_width(FONT_SIZE, fields[i]);
-			fields[i][cursor[i]] = saved;
-			if (offset > available) start -= offset - available;
-			int label_end = left + text_width(FONT_SIZE, labels[i]) + 10;
-			text(c, label_end, y + FONT_SIZE - 1, label_end, right, FONT_SIZE, 0xffffff, form_error);
-		}
-		text(c, start, input_y + FONT_SIZE + 1, left + 4, right - 2, FONT_SIZE, 0xffffff, fields[i]);
-		if (focused) fill(c, start + offset, input_y + 3, 1, FONT_SIZE, BORDER_COLOR);
-	}
 }
 
 static void released(void *data, struct wl_buffer *buffer)
@@ -240,32 +209,11 @@ static void redraw(struct view *v)
 	close(fd);
 	wl_buffer_add_listener(frame->buffer, &buffer_events, frame);
 	struct canvas c = {frame->pixels, width, height};
-	if (v == &dialog) paint_dialog(c);
-	else paint(c);
+	paint(c);
 	wl_surface_attach(v->surface, frame->buffer, 0, 0);
 	wl_surface_damage(v->surface, 0, 0, width, height);
 	wl_surface_commit(v->surface);
 	v->dirty = 0;
-}
-
-static void save_form(void)
-{
-	if (!*fields[Name]) {
-		strcpy(form_error, "Enter a name.");
-		field = Name;
-		return;
-	}
-	if (!library_save(editing, fields[Name], fields[Art])) {
-		close_dialog();
-	} else if (errno == EEXIST) {
-		field = Name;
-		strcpy(form_error, "A config with this name already exists.");
-	} else if (errno == ESTALE) {
-		strcpy(form_error, "File changed. Esc, then reopen to reload.");
-	} else if (errno == EINVAL) {
-		field = Name;
-		strcpy(form_error, "Use a visible filename without / or .meta.");
-	} else snprintf(form_error, sizeof form_error, "Save failed: %s", strerror(errno));
 }
 
 static size_t previous_char(const char *s, size_t pos)
@@ -318,20 +266,6 @@ static void edit_line(char *value, size_t *cursor_pos, xkb_keysym_t sym, uint32_
 		insert_text(value, cursor_pos, typed);
 }
 
-static void form_key(xkb_keysym_t sym, uint32_t code)
-{
-	dialog.dirty = 1;
-	form_error[0] = 0;
-	switch (sym) {
-	case XKB_KEY_Escape: close_dialog(); return;
-	case XKB_KEY_Return: case XKB_KEY_KP_Enter: save_form(); return;
-	case XKB_KEY_Tab: case XKB_KEY_ISO_Left_Tab:
-		field = field == Name ? Art : Name;
-		return;
-	}
-	edit_line(fields[field], &cursor[field], sym, code);
-}
-
 /* Search moves the grid selection; n/N continue from it and wrap around. */
 static int find_title(int start, int direction)
 {
@@ -362,15 +296,69 @@ static void search_key(xkb_keysym_t sym, uint32_t code)
 	found = find_title(search_origin, 1);
 }
 
+static void start_editor(const char *path)
+{
+	if (editor_pid) return;
+	main_view.dirty = 1;
+	const char *editor = getenv("EDITOR");
+	char command[PATH_MAX];
+	if (!editor || !*editor) {
+		strcpy(status, "Set EDITOR to edit game configs");
+		return;
+	}
+	/* The editor command can contain options. The filename is a separate argument. */
+	if (snprintf(command, sizeof command, "exec %s \"$1\"", editor) >= (int)sizeof command) {
+		strcpy(status, "EDITOR command is too long");
+		return;
+	}
+	if (!path) {
+		if (library_draft(editor_draft, &draft_revision)) {
+			snprintf(status, sizeof status, "Cannot create game config: %s", strerror(errno));
+			editor_draft[0] = 0;
+			return;
+		}
+		path = editor_draft;
+	}
+	char *args[] = {"sh", "-c", command, "ludus-editor", (char *)path, NULL};
+	int error = posix_spawn(&editor_pid, "/bin/sh", NULL, NULL, args, environ);
+	if (error) {
+		if (*editor_draft) library_discard_draft(editor_draft, &draft_revision);
+		editor_draft[0] = 0;
+		editor_pid = 0;
+		snprintf(status, sizeof status, "Cannot start editor: %s", strerror(error));
+		return;
+	}
+	strcpy(status, "Editor open");
+}
+
+static void editor_finished(int result)
+{
+	editor_pid = 0;
+	if (*editor_draft) library_discard_draft(editor_draft, &draft_revision);
+	selected = library_load(selected, editor_draft);
+	editor_draft[0] = 0;
+	if (searching) {
+		search_origin = selected;
+		found = find_title(search_origin, 1);
+	}
+	if (WIFSIGNALED(result))
+		snprintf(status, sizeof status, "Editor stopped (signal %d)", WTERMSIG(result));
+	else if (WIFEXITED(result) && WEXITSTATUS(result))
+		snprintf(status, sizeof status, "Editor exited (%d)", WEXITSTATUS(result));
+	else if (!strcmp(status, "Editor open")) status[0] = 0;
+	main_view.dirty = 1;
+}
+
 static void reap(void)
 {
 	int result;
 	pid_t pid;
 	while ((pid = waitpid(-1, &result, WNOHANG)) > 0) {
+		if (pid == editor_pid) { editor_finished(result); continue; }
+		--active;
 		for (int i = 0; i < count; ++i) {
 			if (games[i].pid != pid) continue;
 			games[i].pid = 0;
-			--active;
 			snprintf(status, sizeof status, "Stopped %s", games[i].name);
 			if (WIFEXITED(result) && WEXITSTATUS(result))
 				snprintf(status, sizeof status, "Stopped %s (exit %d)", games[i].name, WEXITSTATUS(result));
@@ -384,6 +372,7 @@ static void press(xkb_keysym_t sym)
 {
 	int col = columns(), old = selected;
 	if (sym == KEY_QUIT) running = 0;
+	if (sym == KEY_ADD || sym == XKB_KEY_KP_Add) { start_editor(NULL); return; }
 	if (sym == KEY_SEARCH) {
 		search_origin = selected;
 		query[0] = 0;
@@ -399,7 +388,7 @@ static void press(xkb_keysym_t sym)
 		main_view.dirty = 1;
 		return;
 	}
-	if (sym == KEY_EDIT) { open_dialog(&games[selected]); return; }
+	if (sym == KEY_EDIT) { start_editor(games[selected].path); return; }
 	if (sym == KEY_LEFT && selected % col > 0) --selected;
 	if (sym == KEY_RIGHT && selected % col < col - 1 && selected + 1 < count) ++selected;
 	if (sym == KEY_UP && selected >= col) selected -= col;
@@ -458,9 +447,8 @@ static int paste_shortcut(xkb_keysym_t sym)
 static int handle_press(uint32_t code)
 {
 	xkb_keysym_t sym = xkb_state_key_get_one_sym(keys, code);
-	int in_form = dialog.surface && focus == dialog.surface;
-	int in_search = searching && focus == main_view.surface;
-	if (in_form || in_search) {
+	if (focus != main_view.surface) return 0;
+	if (searching) {
 		int submit = sym == XKB_KEY_Return || sym == XKB_KEY_KP_Enter;
 		if (submit && clipboard_fd() >= 0) {
 			submit_after_paste = 1;
@@ -469,15 +457,12 @@ static int handle_press(uint32_t code)
 		if (submit_after_paste && sym != XKB_KEY_Escape) return 0;
 		if (sym == XKB_KEY_Escape) submit_after_paste = 0;
 		if (paste_shortcut(sym)) {
-			paste_target = in_form ? (int)field : FieldCount;
 			clipboard_receive();
 			return 0;
 		}
-		if (in_form) form_key(sym, code);
-		else search_key(sym, code);
+		search_key(sym, code);
 		return !submit && sym != XKB_KEY_Escape && sym != XKB_KEY_Tab && sym != XKB_KEY_ISO_Left_Tab;
 	}
-	if (dialog.surface || focus != main_view.surface) return 0;
 	press(sym);
 	return sym == KEY_LEFT || sym == KEY_RIGHT || sym == KEY_UP || sym == KEY_DOWN;
 }
@@ -593,7 +578,7 @@ static void resize(void *data, struct xdg_toplevel *t, int32_t w, int32_t h, str
 	if (h > 0) v->height = h;
 }
 static void closed(void *data, struct xdg_toplevel *t)
-{ (void)t; if (data == &dialog) close_dialog(); else running = 0; }
+{ (void)t; (void)data; running = 0; }
 static const struct xdg_toplevel_listener window_events = { .configure = resize, .close = closed };
 
 static void create_view(struct view *v, const char *title)
@@ -607,62 +592,18 @@ static void create_view(struct view *v, const char *title)
 	xdg_toplevel_set_app_id(v->window, "ludus");
 }
 
-static void open_dialog(struct game *g)
-{
-	if (library_refresh(g)) {
-		snprintf(status, sizeof status, "Cannot read entry: %s", strerror(errno));
-		main_view.dirty = 1;
-		return;
-	}
-	const char *values[FieldCount] = {g->name, g->art};
-	for (int i = 0; i < FieldCount; ++i) {
-		if (strlen(values[i]) >= sizeof fields[i] || strchr(values[i], '\n')) {
-			strcpy(status, "Entry exceeds the single-line field limits");
-			main_view.dirty = 1;
-			return;
-		}
-		strcpy(fields[i], values[i]);
-		cursor[i] = strlen(fields[i]);
-	}
-	editing = g;
-	field = Name;
-	form_error[0] = 0;
-	dialog.width = 520;
-	dialog.height = DialogHeight;
-	create_view(&dialog, "Edit game");
-	xdg_toplevel_set_parent(dialog.window, main_view.window);
-	xdg_toplevel_set_min_size(dialog.window, 420, DialogHeight);
-	xdg_toplevel_set_max_size(dialog.window, 520, DialogHeight);
-	wl_surface_commit(dialog.surface);
-}
-
-static void close_dialog(void)
-{
-	clipboard_cancel();
-	if (focus == dialog.surface) focus = NULL;
-	stop_repeat();
-	submit_after_paste = 0;
-	destroy_view(&dialog);
-	main_view.dirty = 1;
-}
-
 static void finish_paste(void)
 {
 	const char *s = clipboard_read();
 	if (clipboard_fd() >= 0) return;
 	int submit = submit_after_paste;
 	submit_after_paste = 0;
-	if (searching && paste_target == FieldCount) {
+	if (searching) {
 		if (s && insert_text(query, &query_cursor, s)) {
 			found = find_title(search_origin, 1);
 			if (submit) search_key(XKB_KEY_Return, 0);
 		}
 		main_view.dirty = 1;
-	} else if (dialog.surface && paste_target < FieldCount) {
-		if (!s || !insert_text(fields[paste_target], &cursor[paste_target], s))
-			strcpy(form_error, "Cannot paste this text.");
-		else if (submit) save_form();
-		dialog.dirty = 1;
 	}
 }
 
@@ -674,16 +615,15 @@ static void event_loop(void)
 	while (running) {
 		if (wl_display_dispatch_pending(display) < 0) die("Wayland connection lost");
 		if (!running) break;
-		if (active) reap();
+		if (active || editor_pid) reap();
 		redraw(&main_view);
-		redraw(&dialog);
 		fds[0].events = POLLIN;
 		if (wl_display_flush(display) < 0) {
 			if (errno != EAGAIN) die("Wayland connection lost");
 			fds[0].events |= POLLOUT;
 		}
 		fds[1].fd = clipboard_fd();
-		if (poll(fds, 3, active ? 150 : -1) < 0) {
+		if (poll(fds, 3, (active || editor_pid) ? 150 : -1) < 0) {
 			if (errno == EINTR) continue;
 			die(strerror(errno));
 		}
@@ -707,7 +647,7 @@ int main(void)
 	repeat_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
 	if (repeat_fd < 0) die(strerror(errno));
 	font_init(FONT_PATTERN);
-	library_load();
+	selected = library_load(0, NULL);
 	display = wl_display_connect(NULL);
 	if (!display) die("cannot connect to Wayland display");
 	xkb = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
@@ -721,7 +661,6 @@ int main(void)
 	                          Header + Footer + TileHeight + 2 * SPACING);
 	wl_surface_commit(main_view.surface);
 	event_loop();
-	if (dialog.surface) close_dialog();
 	destroy_view(&main_view);
 	clipboard_finish();
 	if (seat) {

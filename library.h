@@ -15,9 +15,9 @@ struct game {
 extern struct game *games;
 extern int count;
 void load_cover(struct game *g);
-void library_load(void);
+int library_load(int selected, const char *preferred);
 void library_finish(void);
-int library_refresh(struct game *g);
-int library_save(struct game *g, const char *name, const char *art);
+int library_draft(char *path, struct stat *revision);
+void library_discard_draft(const char *path, const struct stat *revision);
 int game_launch(struct game *g);
 #endif

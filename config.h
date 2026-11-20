@@ -6,7 +6,7 @@
 #define FONT_PATTERN      "monospace"
 #define HEADER_FONT_SIZE   32
 #define STATUS_FONT_SIZE   16
-#define FONT_SIZE          16  /* Game titles and form fields */
+#define FONT_SIZE          16  /* Game titles */
 
 /* Colors in 0xRRGGBB. */
 #define BACKGROUND        0x000000
@@ -19,6 +19,7 @@
 #define KEY_UP            XKB_KEY_k
 #define KEY_RIGHT         XKB_KEY_l
 #define KEY_LAUNCH        XKB_KEY_Return
+#define KEY_ADD           XKB_KEY_plus
 #define KEY_EDIT          XKB_KEY_e
 #define KEY_QUIT          XKB_KEY_q
 #define KEY_SEARCH        XKB_KEY_slash

@@ -44,10 +44,10 @@ static int cache_path(const struct stat *st, char *path)
 	const char *home = getenv("HOME");
 	char dir[PATH_MAX];
 	if (!home || *home != '/') return 0;
-	if (snprintf(dir, sizeof dir, "%s/.ludus", home) >= (int)sizeof dir ||
+	if (snprintf(dir, sizeof dir, "%s/.cache", home) >= (int)sizeof dir ||
 	    (mkdir(dir, 0700) && errno != EEXIST)) return 0;
-	if (strlen(dir) + sizeof "/cache" > sizeof dir) return 0;
-	strcat(dir, "/cache");
+	if (strlen(dir) + sizeof "/ludus" > sizeof dir) return 0;
+	strcat(dir, "/ludus");
 	if (mkdir(dir, 0700) && errno != EEXIST) return 0;
 	if (snprintf(path, PATH_MAX, "%s/v2-%jx-%jx-%u-%06x.rgb", dir, (uintmax_t)st->st_dev,
 	             (uintmax_t)st->st_ino, (unsigned)COVER_WIDTH, (unsigned)BACKGROUND) >= PATH_MAX) {

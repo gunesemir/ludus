@@ -3,7 +3,6 @@
 #include <errno.h>
 #include <limits.h>
 #include <fcntl.h>
-#include <sys/file.h>
 #include <spawn.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -64,68 +63,6 @@ static FILE *open_config(const char *path, struct stat *revision)
 	return NULL;
 }
 
-static int write_oyna(FILE *out, const struct game *g, const char *art)
-{
-	int change_art = strcmp(g->art, art);
-	if (change_art && *art && fprintf(out, "art=%s\n", art) < 0) return -1;
-
-	/* Keep runner settings, repeated arguments and comments intact. */
-	struct stat revision;
-	FILE *in = open_config(g->path, &revision);
-	if (!in) return -1;
-	char *line = NULL;
-	size_t cap = 0;
-	ssize_t n;
-	int error = 0;
-	if (!same_revision(&g->revision, &revision)) error = ESTALE;
-	while (!error && (n = getline(&line, &cap, in)) >= 0)
-		if ((!change_art || strncmp(line, "art=", 4)) &&
-		    fwrite(line, 1, (size_t)n, out) != (size_t)n)
-			error = errno;
-	if (!error && !feof(in)) error = errno;
-	free(line);
-	fclose(in);
-	if (error) { errno = error; return -1; }
-	return 0;
-}
-
-/* Publish the new entry before retiring a previous title. */
-static int write_game(const char *dest, const struct game *g, const char *art, struct stat *revision)
-{
-	char temp[PATH_MAX];
-	int fd, error = 0;
-	FILE *f;
-	const char *existing = g->path;
-	if (join(temp, dir, ".new-XXXXXX")) return -1;
-	fd = mkstemp(temp);
-	if (fd < 0) return -1;
-	f = fdopen(fd, "w");
-	if (!f) { error = errno; close(fd); }
-	else {
-		if (write_oyna(f, g, art)) error = errno == ENOENT ? ESTALE : errno;
-		if (!error && (fflush(f) || fstat(fd, revision))) error = errno;
-		if (fclose(f)) error = errno;
-	}
-	if (!error) {
-		struct stat current;
-		if (lstat(existing, &current)) error = errno == ENOENT ? ESTALE : errno;
-		else if (!same_revision(&g->revision, &current)) error = ESTALE;
-	}
-	if (!error && !strcmp(existing, dest)) {
-		if (!rename(temp, dest)) return 0;
-		error = errno;
-	} else if (!error) {
-		if (link(temp, dest)) error = errno;
-		else if (unlink(existing)) {
-			error = errno;
-			unlink(dest);
-		}
-	}
-	unlink(temp);
-	if (error) { errno = error; return -1; }
-	return 0;
-}
-
 /* Recognize an oyna file by its required keys. Track only the artwork value. */
 static int read_oyna(FILE *f, char **art)
 {
@@ -182,13 +119,30 @@ static void read_game(const char *path)
 	                               .art = art, .revision = revision};
 }
 
-void library_load(void)
+static void free_games(struct game *list, int length)
+{
+	for (int i = 0; i < length; ++i) {
+		free(list[i].path);
+		free(list[i].thumbnail);
+		free(list[i].art);
+	}
+	free(list);
+}
+
+int library_load(int selected, const char *preferred)
 {
 	const char *home = getenv("HOME");
 	struct dirent **entries;
-	if (!home || *home != '/' || join(dir, home, ".ludus")) { dir[0] = 0; return; }
+	if (!home || *home != '/' || join(dir, home, ".oyna")) { dir[0] = 0; return selected; }
 	int n = scandir(dir, &entries, NULL, alphasort);
-	if (n < 0) { if (errno != ENOENT) perror(dir); return; }
+	if (n < 0 && errno != ENOENT) { perror(dir); return selected; }
+
+	struct game *old = games;
+	int old_count = count;
+	const char *previous = selected < old_count ? old[selected].path : "";
+	int previous_index = -1, preferred_index = -1;
+	games = NULL;
+	count = 0;
 	for (int i = 0; i < n; ++i) {
 		char path[PATH_MAX];
 		const char *name = entries[i]->d_name;
@@ -197,62 +151,71 @@ void library_load(void)
 		    !lstat(path, &st) && S_ISREG(st.st_mode)) read_game(path);
 		free(entries[i]);
 	}
-	free(entries);
-}
+	if (n >= 0) free(entries);
 
-static void replace_art(struct game *g, char *art)
-{
-	if (strcmp(g->art, art)) {
-		free(g->thumbnail);
-		g->thumbnail = NULL;
-		g->tried = 0;
+	for (int i = 0; i < count; ++i) {
+		if (!strcmp(previous, games[i].path)) previous_index = i;
+		if (preferred && !strcmp(preferred, games[i].path)) preferred_index = i;
 	}
-	free(g->art);
-	g->art = art;
+	for (int j = 0; j < old_count; ++j) {
+		if (!old[j].pid) continue;
+		for (int i = 0; i < count; ++i) {
+			struct game *g = &games[i];
+			if (g->pid) continue;
+			if (!strcmp(old[j].path, g->path) ||
+			    (old[j].revision.st_dev == g->revision.st_dev &&
+			     old[j].revision.st_ino == g->revision.st_ino)) {
+				g->pid = old[j].pid;
+				break;
+			}
+		}
+	}
+	free_games(old, old_count);
+	if (preferred_index >= 0) return preferred_index;
+	if (previous_index >= 0) return previous_index;
+	return selected < count ? selected : count ? count - 1 : 0;
 }
 
-int library_refresh(struct game *g)
+int library_draft(char *path, struct stat *revision)
+{
+	const char template[] =
+		"# Save this file under the game title in ~/.oyna/.\n"
+		"exe=\n"
+		"WINEPREFIX=\n"
+		"PROTONPATH=\n"
+		"art=\n";
+	if (!*dir) { errno = ENOENT; return -1; }
+	if (mkdir(dir, 0700) && errno != EEXIST) return -1;
+
+	int fd;
+	for (unsigned i = 1; ; ++i) {
+		char name[32] = "New game";
+		if (i > 1) snprintf(name, sizeof name, "New game %u", i);
+		if (join(path, dir, name)) return -1;
+		fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+		if (fd >= 0) break;
+		if (errno != EEXIST) return -1;
+	}
+	FILE *f = fdopen(fd, "w");
+	int error = 0;
+	if (!f) { error = errno; close(fd); }
+	else {
+		if (fputs(template, f) == EOF || fflush(f) || fstat(fd, revision)) error = errno;
+		if (fclose(f) && !error) error = errno;
+	}
+	if (error) { unlink(path); errno = error; return -1; }
+	return 0;
+}
+
+void library_discard_draft(const char *path, const struct stat *revision)
 {
 	struct stat current;
-	if (lstat(g->path, &current)) return -1;
-	if (!S_ISREG(current.st_mode)) { errno = ESTALE; return -1; }
-	if (same_revision(&g->revision, &current)) return 0;
-	char *art = load_art(g->path, &current);
-	if (!art) return -1;
-	replace_art(g, art);
-	g->revision = current;
-	return 0;
-}
-
-int library_save(struct game *g, const char *name, const char *art)
-{
-	char dest[PATH_MAX];
-	struct stat revision;
-	if (!valid_name(name)) { errno = EINVAL; return -1; }
-	if (join(dest, dir, name)) return -1;
-	int fd = open(dir, O_DIRECTORY | O_RDONLY | O_CLOEXEC);
-	if (fd < 0) return -1;
-	int result = flock(fd, LOCK_EX);
-	if (!result) result = write_game(dest, g, art, &revision);
-	int error = errno;
-	close(fd);
-	if (result) { errno = error; return -1; }
-	replace_art(g, copy(art));
-	free(g->path);
-	g->path = copy(dest);
-	g->name = strrchr(g->path, '/') + 1;
-	g->revision = revision;
-	return 0;
+	if (!lstat(path, &current) && same_revision(revision, &current)) unlink(path);
 }
 
 void library_finish(void)
 {
-	for (int i = 0; i < count; ++i) {
-		free(games[i].path);
-		free(games[i].thumbnail);
-		free(games[i].art);
-	}
-	free(games);
+	free_games(games, count);
 }
 
 int game_launch(struct game *g)

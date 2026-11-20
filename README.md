@@ -14,6 +14,9 @@ make
 ./ludus
 ```
 
+Use `make install` to install Ludus in `/usr/local/bin` and `make uninstall`
+to remove it. Set `PREFIX` on both commands to use another installation prefix.
+
 Ludus uses your system's `monospace` font. To change the font, colors, cover
 size, or keybindings, edit `config.h` and run `make` again.
 

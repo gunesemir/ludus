@@ -1,5 +1,7 @@
 CC = cc
 CFLAGS = -O2 -Wall -Wextra -pedantic
+PREFIX ?= /usr/local
+BINDIR ?= $(PREFIX)/bin
 PKG_CONFIG ?= pkg-config
 SCANNER ?= wayland-scanner
 WAYLAND_CFLAGS = $(shell $(PKG_CONFIG) --cflags wayland-client xkbcommon fontconfig freetype2)
@@ -36,7 +38,14 @@ build/xdg-shell.c: $(PROTOCOL) | build
 build:
 	mkdir -p $@
 
+install: ludus
+	install -d "$(DESTDIR)$(BINDIR)"
+	install -m 755 ludus "$(DESTDIR)$(BINDIR)/"
+
+uninstall:
+	rm -f "$(DESTDIR)$(BINDIR)/ludus"
+
 clean:
 	rm -rf build ludus
 
-.PHONY: clean
+.PHONY: install uninstall clean

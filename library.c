@@ -23,21 +23,7 @@ static char *copy(const char *value)
 	return s;
 }
 
-int library_append(char *const values[FieldCount])
-{
-	struct game *p = realloc(games, (size_t)(count + 1) * sizeof(*games));
-	if (!p) { perror("ludus: realloc"); exit(EXIT_FAILURE); }
-	games = p;
-	games[count] = (struct game){0};
-	for (int i = 0; i < FieldCount; ++i)
-		games[count].value[i] = copy(values[i] ? values[i] : "");
-	return count++;
-}
-
 static char dir[PATH_MAX];
-static const char *const keys[FieldCount] = {
-	"name", "exe", "workdir", "art", "runner", "WINEPREFIX", "PROTONPATH", "cmd"
-};
 
 static int join(char *dst, const char *a, const char *b)
 {
@@ -48,30 +34,11 @@ static int join(char *dst, const char *a, const char *b)
 	return 0;
 }
 
-static int valid(char *const v[FieldCount])
+static int valid_name(const char *name)
 {
-	return *v[Name] && (v[Exe][0] == '/' || (!*v[Exe] && *v[Launch])) && (!*v[Art] || v[Art][0] == '/') &&
-	       (!*v[Prefix] || v[Prefix][0] == '/') && (!*v[Workdir] || v[Workdir][0] == '/');
-}
-
-/* Keep titles readable while encoding filename separators and literal escapes. */
-static int game_path(char *dest, const char *name)
-{
-	char file[NAME_MAX + 1];
-	size_t n = 0;
-	for (const char *p = name; *p; ++p) {
-		const char *escape = NULL;
-		if (*p == '/') escape = "%2F";
-		if (*p == '%') escape = "%25";
-		if (p == name && *p == '.') escape = "%2E";
-		size_t bytes = escape ? 3 : 1;
-		if (n + bytes + sizeof ".meta" > sizeof file) { errno = ENAMETOOLONG; return -1; }
-		if (escape) memcpy(file + n, escape, bytes);
-		else file[n] = *p;
-		n += bytes;
-	}
-	strcpy(file + n, ".meta");
-	return join(dest, dir, file);
+	size_t len = strlen(name);
+	return len && name[0] != '.' && !strchr(name, '/') &&
+	       (len < 5 || strcmp(name + len - 5, ".meta"));
 }
 
 static int same_revision(const struct stat *a, const struct stat *b)
@@ -97,23 +64,20 @@ static FILE *open_config(const char *path, struct stat *revision)
 	return NULL;
 }
 
-static int write_oyna(FILE *out, const struct game *old, char *const values[FieldCount])
+static int write_oyna(FILE *out, const struct game *g, const char *art)
 {
-	int change_art = !old || strcmp(old->value[Art], values[Art]);
-	if (!old && fprintf(out, "exe=%s\nWINEPREFIX=%s\nPROTONPATH=%s\n",
-	                    values[Exe], values[Prefix], values[Proton]) < 0) return -1;
-	if (change_art && *values[Art] && fprintf(out, "art=%s\n", values[Art]) < 0) return -1;
-	if (!old) return 0;
+	int change_art = strcmp(g->art, art);
+	if (change_art && *art && fprintf(out, "art=%s\n", art) < 0) return -1;
 
 	/* Keep runner settings, repeated arguments and comments intact. */
 	struct stat revision;
-	FILE *in = open_config(old->path, &revision);
+	FILE *in = open_config(g->path, &revision);
 	if (!in) return -1;
 	char *line = NULL;
 	size_t cap = 0;
 	ssize_t n;
 	int error = 0;
-	if (!same_revision(&old->revision, &revision)) error = ESTALE;
+	if (!same_revision(&g->revision, &revision)) error = ESTALE;
 	while (!error && (n = getline(&line, &cap, in)) >= 0)
 		if ((!change_art || strncmp(line, "art=", 4)) &&
 		    fwrite(line, 1, (size_t)n, out) != (size_t)n)
@@ -126,39 +90,33 @@ static int write_oyna(FILE *out, const struct game *old, char *const values[Fiel
 }
 
 /* Publish the new entry before retiring a previous title. */
-static int write_game(const char *dest, const struct game *old, char *const values[FieldCount],
-                      int oyna, struct stat *revision)
+static int write_game(const char *dest, const struct game *g, const char *art, struct stat *revision)
 {
 	char temp[PATH_MAX];
 	int fd, error = 0;
 	FILE *f;
-	const char *existing = old ? old->path : NULL;
+	const char *existing = g->path;
 	if (join(temp, dir, ".new-XXXXXX")) return -1;
 	fd = mkstemp(temp);
 	if (fd < 0) return -1;
 	f = fdopen(fd, "w");
 	if (!f) { error = errno; close(fd); }
 	else {
-		if (oyna) {
-			if (write_oyna(f, old, values)) error = errno == ENOENT && old ? ESTALE : errno;
-		} else {
-			for (int i = 0; i < FieldCount; ++i)
-				if (fprintf(f, "%s=%s\n", keys[i], values[i]) < 0) { error = errno; break; }
-		}
+		if (write_oyna(f, g, art)) error = errno == ENOENT ? ESTALE : errno;
 		if (!error && (fflush(f) || fstat(fd, revision))) error = errno;
 		if (fclose(f)) error = errno;
 	}
-	if (!error && existing) {
+	if (!error) {
 		struct stat current;
 		if (lstat(existing, &current)) error = errno == ENOENT ? ESTALE : errno;
-		else if (!same_revision(&old->revision, &current)) error = ESTALE;
+		else if (!same_revision(&g->revision, &current)) error = ESTALE;
 	}
-	if (!error && existing && !strcmp(existing, dest)) {
+	if (!error && !strcmp(existing, dest)) {
 		if (!rename(temp, dest)) return 0;
 		error = errno;
 	} else if (!error) {
 		if (link(temp, dest)) error = errno;
-		else if (existing && unlink(existing)) {
+		else if (unlink(existing)) {
 			error = errno;
 			unlink(dest);
 		}
@@ -168,30 +126,8 @@ static int write_game(const char *dest, const struct game *old, char *const valu
 	return 0;
 }
 
-static int read_meta(FILE *f, char **values)
-{
-	char *line = NULL;
-	size_t cap = 0;
-	ssize_t n;
-	int ok = 1;
-	while ((n = getline(&line, &cap, f)) >= 0) {
-		if (memchr(line, 0, n)) { ok = 0; break; }
-		while (n && (line[n-1] == '\n' || line[n-1] == '\r')) line[--n] = 0;
-		if (!n || line[0] == '#') continue;
-		char *value = strchr(line, '=');
-		if (!value) { ok = 0; break; }
-		*value++ = 0;
-		int i = 0;
-		while (i < FieldCount && strcmp(keys[i], line)) ++i;
-		if (i == FieldCount || values[i]) { ok = 0; break; }
-		values[i] = copy(value);
-	}
-	free(line);
-	return ok && !ferror(f);
-}
-
 /* Recognize an oyna file by its required keys. Track only the artwork value. */
-static int read_oyna(FILE *f, char **values)
+static int read_oyna(FILE *f, char **art)
 {
 	char *line = NULL;
 	size_t cap = 0;
@@ -206,8 +142,8 @@ static int read_oyna(FILE *f, char **values)
 		else if (!strncmp(line, "WINEPREFIX=", 11)) prefix = line[11] != 0;
 		else if (!strncmp(line, "PROTONPATH=", 11)) proton = line[11] != 0;
 		else if (!strncmp(line, "art=", 4)) {
-			free(values[Art]);
-			values[Art] = copy(line + 4);
+			free(*art);
+			*art = copy(line + 4);
 		}
 	}
 	free(line);
@@ -215,41 +151,35 @@ static int read_oyna(FILE *f, char **values)
 }
 
 /* Both snapshots refer to the descriptor from which we parsed the entry. */
-static int load_values(const char *path, char **values, struct stat *revision, int oyna)
+static char *load_art(const char *path, struct stat *revision)
 {
 	struct stat after;
 	FILE *f = open_config(path, revision);
-	if (!f) return -1;
+	if (!f) return NULL;
+	char *art = NULL;
 	int error = 0;
-	if (oyna) {
-		if (!read_oyna(f, values)) error = EINVAL;
-		values[Name] = copy(strrchr(path, '/') + 1);
-	} else if (!read_meta(f, values)) error = EINVAL;
-	for (int i = 0; i < FieldCount; ++i)
-		if (!error && !values[i]) values[i] = copy("");
-	if (!error && !oyna && !valid(values)) error = EINVAL;
-	if (!error && fstat(fileno(f), &after)) error = errno;
-	if (!error && !same_revision(revision, &after)) error = ESTALE;
+	if (!read_oyna(f, &art)) error = EINVAL;
+	else if (fstat(fileno(f), &after)) error = errno;
+	else if (!same_revision(revision, &after)) error = ESTALE;
 	fclose(f);
-	if (error) { errno = error; return -1; }
-	return 0;
+	if (error) { free(art); errno = error; return NULL; }
+	return art ? art : copy("");
 }
 
-static int read_game(const char *path, int oyna)
+static void read_game(const char *path)
 {
-	char *values[FieldCount] = {0};
 	struct stat revision;
-	int result = load_values(path, values, &revision, oyna);
-	if (!result) {
-		int index = library_append(values);
-		games[index].path = copy(path);
-		games[index].revision = revision;
-		games[index].oyna = oyna;
+	char *art = load_art(path, &revision);
+	if (!art) {
+		if (errno != EINVAL) perror(path);
+		return;
 	}
-	int error = errno;
-	for (int i = 0; i < FieldCount; ++i) free(values[i]);
-	errno = error;
-	return result;
+	struct game *p = realloc(games, (size_t)(count + 1) * sizeof(*games));
+	if (!p) { perror("ludus: realloc"); exit(EXIT_FAILURE); }
+	games = p;
+	char *file = copy(path);
+	games[count++] = (struct game){.path = file, .name = strrchr(file, '/') + 1,
+	                               .art = art, .revision = revision};
 }
 
 void library_load(void)
@@ -262,84 +192,57 @@ void library_load(void)
 	for (int i = 0; i < n; ++i) {
 		char path[PATH_MAX];
 		const char *name = entries[i]->d_name;
-		size_t len = strlen(name);
-		int meta = len > 5 && !strcmp(name + len - 5, ".meta");
 		struct stat st;
-		if ((meta || name[0] != '.') && !join(path, dir, name) &&
-		    !lstat(path, &st) && S_ISREG(st.st_mode)) {
-			int result = meta ? read_game(path, 0) : -1;
-			if (result && name[0] != '.') result = read_game(path, 1);
-			if (result && (meta || errno != EINVAL)) perror(path);
-		}
+		if (valid_name(name) && !join(path, dir, name) &&
+		    !lstat(path, &st) && S_ISREG(st.st_mode)) read_game(path);
 		free(entries[i]);
 	}
 	free(entries);
 }
 
-static void replace_values(struct game *g, char *const values[FieldCount])
+static void replace_art(struct game *g, char *art)
 {
-	if (strcmp(g->value[Art], values[Art])) {
+	if (strcmp(g->art, art)) {
 		free(g->thumbnail);
 		g->thumbnail = NULL;
 		g->tried = 0;
 	}
-	for (int i = 0; i < FieldCount; ++i) {
-		free(g->value[i]);
-		g->value[i] = copy(values[i]);
-	}
-	g->command = NULL;
+	free(g->art);
+	g->art = art;
 }
 
-int library_refresh(int index)
+int library_refresh(struct game *g)
 {
-	struct game *g = &games[index];
 	struct stat current;
-	if (!g->path) return 0;
 	if (lstat(g->path, &current)) return -1;
 	if (!S_ISREG(current.st_mode)) { errno = ESTALE; return -1; }
 	if (same_revision(&g->revision, &current)) return 0;
-	char *values[FieldCount] = {0};
-	int result = load_values(g->path, values, &current, g->oyna);
-	int error = errno;
-	if (!result) {
-		replace_values(g, values);
-		g->revision = current;
-	}
-	for (int i = 0; i < FieldCount; ++i) free(values[i]);
-	errno = error;
-	return result;
+	char *art = load_art(g->path, &current);
+	if (!art) return -1;
+	replace_art(g, art);
+	g->revision = current;
+	return 0;
 }
 
-int library_save(int index, char *const values[FieldCount])
+int library_save(struct game *g, const char *name, const char *art)
 {
 	char dest[PATH_MAX];
 	struct stat revision;
-	struct game *old = index >= 0 ? &games[index] : NULL;
-	int oyna = old && old->oyna;
-	if (!oyna && !valid(values)) { errno = EINVAL; return -1; }
-	if (!old && !strcmp(values[Runner], "oyna") && !*values[Workdir] && !*values[Launch] &&
-	    *values[Exe] && *values[Prefix] && values[Proton][0] == '/') oyna = 1;
-	if (!*dir) { errno = ENOENT; return -1; }
-	if (oyna) {
-		const char *name = values[Name];
-		if (!*name || name[0] == '.' || strchr(name, '/')) { errno = EINVAL; return -1; }
-		if (join(dest, dir, name)) return -1;
-	} else if (game_path(dest, values[Name])) return -1;
-	if (mkdir(dir, 0700) && errno != EEXIST) return -1;
+	if (!valid_name(name)) { errno = EINVAL; return -1; }
+	if (join(dest, dir, name)) return -1;
 	int fd = open(dir, O_DIRECTORY | O_RDONLY | O_CLOEXEC);
 	if (fd < 0) return -1;
 	int result = flock(fd, LOCK_EX);
-	if (!result) result = write_game(dest, old, values, oyna, &revision);
+	if (!result) result = write_game(dest, g, art, &revision);
 	int error = errno;
 	close(fd);
 	if (result) { errno = error; return -1; }
-	if (index < 0) index = library_append(values);
-	else replace_values(&games[index], values);
-	free(games[index].path);
-	games[index].path = copy(dest);
-	games[index].revision = revision;
-	games[index].oyna = oyna;
-	return index;
+	replace_art(g, copy(art));
+	free(g->path);
+	g->path = copy(dest);
+	g->name = strrchr(g->path, '/') + 1;
+	g->revision = revision;
+	return 0;
 }
 
 void library_finish(void)
@@ -347,75 +250,17 @@ void library_finish(void)
 	for (int i = 0; i < count; ++i) {
 		free(games[i].path);
 		free(games[i].thumbnail);
-		for (int j = 0; j < FieldCount; ++j) free(games[i].value[j]);
+		free(games[i].art);
 	}
 	free(games);
 }
 
-/* File actions run in the child, before PATH lookup and exec. */
-static int spawn_game(pid_t *pid, char **args, char **env, const char *workdir)
+int game_launch(struct game *g)
 {
-	if (!*workdir) return posix_spawnp(pid, args[0], NULL, NULL, args, env);
-	posix_spawn_file_actions_t actions;
-	int error = posix_spawn_file_actions_init(&actions);
-	if (error) return error;
-	error = posix_spawn_file_actions_addchdir_np(&actions, workdir);
-	if (!error) error = posix_spawnp(pid, args[0], &actions, NULL, args, env);
-	posix_spawn_file_actions_destroy(&actions);
-	return error;
-}
-
-int game_launch(struct game *g, const char **program)
-{
-	char *launch[7], **args = launch;
-	size_t argc = 0;
-	if (g->oyna) {
-		char *oyna_args[] = {"oyna", "--config", g->path, NULL};
-		*program = oyna_args[0];
-		if (g->pid) return EALREADY;
-		pid_t pid;
-		int error = posix_spawnp(&pid, *program, NULL, NULL, oyna_args, environ);
-		if (!error) g->pid = pid;
-		return error;
-	}
-	if (*g->value[Launch]) {
-		launch[argc++] = "/bin/sh";
-		launch[argc++] = "-c";
-		launch[argc++] = g->value[Launch];
-		launch[argc++] = "ludus";
-	}
-	if (*g->value[Runner]) launch[argc++] = g->value[Runner];
-	if (*g->value[Exe]) launch[argc++] = g->value[Exe];
-	launch[argc] = NULL;
-	if (g->command) args = g->command;
-	char *prefix = g->value[Prefix], *proton = g->value[Proton];
-	char prefix_env[PATH_MAX + 12], proton_env[PATH_MAX + 12], pwd_env[PATH_MAX + 4];
-	const char *workdir = g->value[Workdir];
-	char **env;
-	size_t i, n = 0;
-	int error;
-	pid_t pid;
-	*program = args[0];
 	if (g->pid) return EALREADY;
-	if (!args[0] || !*args[0]) return ENOEXEC;
-	if (snprintf(pwd_env, sizeof pwd_env, "PWD=%s", workdir) >= (int)sizeof pwd_env ||
-	    snprintf(prefix_env, sizeof prefix_env, "WINEPREFIX=%s", prefix) >= (int)sizeof prefix_env ||
-	    snprintf(proton_env, sizeof proton_env, "PROTONPATH=%s", proton) >= (int)sizeof proton_env)
-		return ENAMETOOLONG;
-	for (i = 0; environ[i]; ++i) {}
-	env = calloc(i + 4, sizeof *env);
-	if (!env) return ENOMEM;
-	for (i = 0; environ[i]; ++i) {
-		if (*workdir && !strncmp(environ[i], "PWD=", 4)) continue;
-		if (*prefix && !strncmp(environ[i], "WINEPREFIX=", 11)) continue;
-		if (*proton && !strncmp(environ[i], "PROTONPATH=", 11)) continue;
-		env[n++] = environ[i];
-	}
-	if (*workdir) env[n++] = pwd_env;
-	if (*prefix) env[n++] = prefix_env;
-	if (*proton) env[n++] = proton_env;
-	error = spawn_game(&pid, args, env, workdir);
-	free(env);
+	char *args[] = {"oyna", "--config", g->path, NULL};
+	pid_t pid;
+	int error = posix_spawnp(&pid, args[0], NULL, NULL, args, environ);
 	if (!error) g->pid = pid;
 	return error;
 }

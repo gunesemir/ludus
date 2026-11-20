@@ -25,13 +25,15 @@
 #error "Use a cover width of 2..4096 and spacing of 4..1024."
 #endif
 
+enum field { Name, Art, FieldCount };
 enum {
 	CoverHeight = COVER_WIDTH * 3 / 2,
 	TitleLines = 3,
 	TileHeight = CoverHeight + 6 + TitleLines * (FONT_SIZE + 3),
 	Header = HEADER_FONT_SIZE + 20,
 	Footer = STATUS_FONT_SIZE + 6,
-	Row = FONT_SIZE * 2 + 12
+	Row = FONT_SIZE * 2 + 12,
+	DialogHeight = FieldCount * Row + 8
 };
 struct view {
 	struct wl_surface *surface;
@@ -56,10 +58,9 @@ static size_t query_cursor;
 static int submit_after_paste;
 static enum field field;
 static size_t cursor[FieldCount];
-static int editing, dialog_oyna;
-static const int oyna_fields[] = {Name, Art};
-static const char *labels[] = {"Name", "Executable", "Working directory", "Artwork", "Runner", "Prefix", "Wine/Proton version", "Launch command"};
-static void open_dialog(int index);
+static struct game *editing;
+static const char *labels[] = {"Name", "Artwork"};
+static void open_dialog(struct game *g);
 static void close_dialog(void);
 static struct wl_display *display;
 static struct wl_compositor *compositor;
@@ -122,7 +123,7 @@ static void paint(struct canvas c)
 			fill(c, left - 2, top - 2, COVER_WIDTH + 4, CoverHeight + 4, BORDER_COLOR);
 		if (!games[i].tried) load_cover(&games[i]);
 		wrapped_title(c, left, top + CoverHeight + 6 + FONT_SIZE, COVER_WIDTH, FONT_SIZE,
-		              TitleLines, 0xffffff, games[i].value[Name]);
+		              TitleLines, 0xffffff, games[i].name);
 		if (!games[i].thumbnail) {
 			fill(c, left, top, COVER_WIDTH, CoverHeight, 0x38393b);
 			continue;
@@ -141,7 +142,7 @@ static void paint(struct canvas c)
 	cached_end = end;
 	fill(c, 0, bar, width, Footer, BAR_BACKGROUND);
 	if (searching) {
-		const char *match = found ? games[selected].value[Name] : "No match";
+		const char *match = found ? games[selected].name : "No match";
 		char prompt[sizeof query + 2];
 		snprintf(prompt, sizeof prompt, "/%s", query);
 		int edge = width / 2;
@@ -156,7 +157,7 @@ static void paint(struct canvas c)
 		return;
 	}
 	text(c, 6, bar + STATUS_FONT_SIZE + 1, 0, split - 4, STATUS_FONT_SIZE, 0xffffff,
-	     count ? games[selected].value[Name] : "+ Add game");
+	     count ? games[selected].name : "Put oyna configs in ~/.ludus/");
 	if (*status)
 		text(c, status_x, bar + STATUS_FONT_SIZE + 1, split, right, STATUS_FONT_SIZE, 0xffffff, status);
 
@@ -165,12 +166,10 @@ static void paint(struct canvas c)
 static void paint_dialog(struct canvas c)
 {
 	int left = 14, right = c.width - 14;
-	int rows = dialog_oyna ? 2 : FieldCount;
-	int step = (c.height - 8) / rows;
+	int step = (c.height - 8) / FieldCount;
 	fill(c, 0, 0, c.width, c.height, BAR_BACKGROUND);
-	for (int row = 0; row < rows; ++row) {
-		int i = dialog_oyna ? oyna_fields[row] : row;
-		int y = 4 + row * step, start = left + 5;
+	for (int i = 0; i < FieldCount; ++i) {
+		int y = 4 + i * step, start = left + 5;
 		int input_y = y + FONT_SIZE + 2;
 		int available = right - start - 5, offset = 0;
 		int focused = i == (int)field;
@@ -251,39 +250,22 @@ static void redraw(struct view *v)
 
 static void save_form(void)
 {
-	char *values[FieldCount];
-	for (int i = 0; i < FieldCount; ++i) values[i] = fields[i];
 	if (!*fields[Name]) {
 		strcpy(form_error, "Enter a name.");
 		field = Name;
 		return;
 	}
-	if (!dialog_oyna) {
-		if (!*fields[Exe] && !*fields[Launch]) {
-			strcpy(form_error, "Enter a path or a launch command.");
-			field = Exe;
-			return;
-		}
-		for (int i = Exe; i <= Prefix; ++i) {
-			if (i == Runner || !*fields[i]) continue;
-			if (*fields[i] != '/') {
-				strcpy(form_error, "Enter an absolute path.");
-				field = i;
-				return;
-			}
-		}
-	}
-	int result = library_save(editing, values);
-	if (result < 0 && errno == EEXIST) {
+	if (!library_save(editing, fields[Name], fields[Art])) {
+		close_dialog();
+	} else if (errno == EEXIST) {
 		field = Name;
 		strcpy(form_error, "A config with this name already exists.");
-	} else if (result < 0 && errno == ESTALE) {
+	} else if (errno == ESTALE) {
 		strcpy(form_error, "File changed. Esc, then reopen to reload.");
-	} else if (result < 0 && errno == EINVAL) {
+	} else if (errno == EINVAL) {
 		field = Name;
-		strcpy(form_error, "Use a filename without / or a leading dot.");
-	} else if (result < 0) snprintf(form_error, sizeof form_error, "Save failed: %s", strerror(errno));
-	else { selected = result; close_dialog(); }
+		strcpy(form_error, "Use a visible filename without / or .meta.");
+	} else snprintf(form_error, sizeof form_error, "Save failed: %s", strerror(errno));
 }
 
 static size_t previous_char(const char *s, size_t pos)
@@ -344,8 +326,7 @@ static void form_key(xkb_keysym_t sym, uint32_t code)
 	case XKB_KEY_Escape: close_dialog(); return;
 	case XKB_KEY_Return: case XKB_KEY_KP_Enter: save_form(); return;
 	case XKB_KEY_Tab: case XKB_KEY_ISO_Left_Tab:
-		if (dialog_oyna) field = field == Name ? Art : Name;
-		else field = (field + (sym == XKB_KEY_Tab ? 1 : FieldCount - 1)) % FieldCount;
+		field = field == Name ? Art : Name;
 		return;
 	}
 	edit_line(fields[field], &cursor[field], sym, code);
@@ -358,7 +339,7 @@ static int find_title(int start, int direction)
 	for (int n = 0; n < count; ++n) {
 		if (i < 0) i = count - 1;
 		if (i >= count) i = 0;
-		if (FcStrStrIgnoreCase((FcChar8 *)games[i].value[Name], (FcChar8 *)query)) {
+		if (FcStrStrIgnoreCase((const FcChar8 *)games[i].name, (const FcChar8 *)query)) {
 			selected = i;
 			return 1;
 		}
@@ -390,9 +371,9 @@ static void reap(void)
 			if (games[i].pid != pid) continue;
 			games[i].pid = 0;
 			--active;
-			snprintf(status, sizeof status, "Stopped %s", games[i].value[Name]);
+			snprintf(status, sizeof status, "Stopped %s", games[i].name);
 			if (WIFEXITED(result) && WEXITSTATUS(result))
-				snprintf(status, sizeof status, "Stopped %s (exit %d)", games[i].value[Name], WEXITSTATUS(result));
+				snprintf(status, sizeof status, "Stopped %s (exit %d)", games[i].name, WEXITSTATUS(result));
 			main_view.dirty = 1;
 			break;
 		}
@@ -403,7 +384,6 @@ static void press(xkb_keysym_t sym)
 {
 	int col = columns(), old = selected;
 	if (sym == KEY_QUIT) running = 0;
-	if (sym == KEY_ADD || sym == XKB_KEY_KP_Add) { open_dialog(-1); return; }
 	if (sym == KEY_SEARCH) {
 		search_origin = selected;
 		query[0] = 0;
@@ -419,7 +399,7 @@ static void press(xkb_keysym_t sym)
 		main_view.dirty = 1;
 		return;
 	}
-	if (sym == KEY_EDIT) { open_dialog(selected); return; }
+	if (sym == KEY_EDIT) { open_dialog(&games[selected]); return; }
 	if (sym == KEY_LEFT && selected % col > 0) --selected;
 	if (sym == KEY_RIGHT && selected % col < col - 1 && selected + 1 < count) ++selected;
 	if (sym == KEY_UP && selected >= col) selected -= col;
@@ -429,18 +409,12 @@ static void press(xkb_keysym_t sym)
 	}
 	if (sym == KEY_LAUNCH) {
 		struct game *g = &games[selected];
-		const char *program;
-		int error = game_launch(g, &program);
+		int error = game_launch(g);
 		if (error == EALREADY || !error)
-			snprintf(status, sizeof status, "Playing %s", g->value[Name]);
+			snprintf(status, sizeof status, "Playing %s", g->name);
 		else {
-			if (program && *program && *g->value[Workdir])
-				snprintf(status, sizeof status, "Cannot start %s in %s: %s", program, g->value[Workdir], strerror(error));
-			else if (program && *program)
-				snprintf(status, sizeof status, "Cannot start %s: %s", program, strerror(error));
-			else
-				snprintf(status, sizeof status, "No launch command or executable configured");
-			fprintf(stderr, "ludus: %s: %s\n", g->value[Name], status);
+			snprintf(status, sizeof status, "Cannot start oyna: %s", strerror(error));
+			fprintf(stderr, "ludus: %s: %s\n", g->name, status);
 		}
 		if (!error) ++active;
 		main_view.dirty = 1;
@@ -633,78 +607,33 @@ static void create_view(struct view *v, const char *title)
 	xdg_toplevel_set_app_id(v->window, "ludus");
 }
 
-/* Represent a CLI entry as editable shell words without losing argv boundaries. */
-static int command_text(char **argv)
+static void open_dialog(struct game *g)
 {
-	char *out = fields[Launch], *end = out + sizeof fields[Launch] - 1;
-	for (; *argv; ++argv) {
-		if (out != fields[Launch]) {
-			if (out == end) return -1;
-			*out++ = ' ';
-		}
-		if (out == end) return -1;
-		*out++ = '\'';
-		for (const char *p = *argv; *p; ++p) {
-			if (*p == '\'') {
-				if (end - out < 4) return -1;
-				memcpy(out, "'\\''", 4);
-				out += 4;
-			} else {
-				if (out == end || *p == '\n') return -1;
-				*out++ = *p;
-			}
-		}
-		if (out == end) return -1;
-		*out++ = '\'';
+	if (library_refresh(g)) {
+		snprintf(status, sizeof status, "Cannot read entry: %s", strerror(errno));
+		main_view.dirty = 1;
+		return;
 	}
-	*out = 0;
-	return 0;
-}
-
-static void open_dialog(int index)
-{
-	editing = index;
-	dialog_oyna = 0;
-	memset(fields, 0, sizeof fields);
-	if (index >= 0) {
-		struct game *g = &games[index];
-		if (library_refresh(index)) {
-			snprintf(status, sizeof status, "Cannot read entry: %s", strerror(errno));
+	const char *values[FieldCount] = {g->name, g->art};
+	for (int i = 0; i < FieldCount; ++i) {
+		if (strlen(values[i]) >= sizeof fields[i] || strchr(values[i], '\n')) {
+			strcpy(status, "Entry exceeds the single-line field limits");
 			main_view.dirty = 1;
 			return;
 		}
-		dialog_oyna = g->oyna;
-		for (int i = 0; i < FieldCount; ++i) {
-			if (dialog_oyna && i != Name && i != Art) continue;
-			if (strlen(g->value[i]) >= sizeof fields[i] || strchr(g->value[i], '\n')) goto uneditable;
-			strcpy(fields[i], g->value[i]);
-		}
-		if (!dialog_oyna && *fields[Art] && fields[Art][0] != '/') {
-			char cwd[PATH_MAX];
-			if (!getcwd(cwd, sizeof cwd) ||
-			    snprintf(fields[Art], PATH_MAX, "%s/%s", cwd, g->value[Art]) >= PATH_MAX)
-				goto uneditable;
-		}
-		if (g->command) {
-			if (!getcwd(fields[Workdir], sizeof fields[Workdir]) || command_text(g->command))
-				goto uneditable;
-		}
+		strcpy(fields[i], values[i]);
+		cursor[i] = strlen(fields[i]);
 	}
-	for (int i = 0; i < FieldCount; ++i) cursor[i] = strlen(fields[i]);
+	editing = g;
 	field = Name;
 	form_error[0] = 0;
 	dialog.width = 520;
-	int height = (dialog_oyna ? 2 : FieldCount) * Row + 8;
-	dialog.height = height;
-	create_view(&dialog, index < 0 ? "Add game" : "Edit game");
+	dialog.height = DialogHeight;
+	create_view(&dialog, "Edit game");
 	xdg_toplevel_set_parent(dialog.window, main_view.window);
-	xdg_toplevel_set_min_size(dialog.window, 420, height);
-	xdg_toplevel_set_max_size(dialog.window, 520, height);
+	xdg_toplevel_set_min_size(dialog.window, 420, DialogHeight);
+	xdg_toplevel_set_max_size(dialog.window, 520, DialogHeight);
 	wl_surface_commit(dialog.surface);
-	return;
-uneditable:
-	strcpy(status, "Entry exceeds the single-line field limits");
-	main_view.dirty = 1;
 }
 
 static void close_dialog(void)
@@ -769,10 +698,9 @@ static void event_loop(void)
 	}
 }
 
-int main(int argc, char **argv)
+int main(void)
 {
 	struct wl_registry *registry;
-	int i;
 	struct sigaction action = { .sa_handler = SIG_DFL };
 	sigemptyset(&action.sa_mask);
 	if (sigaction(SIGCHLD, &action, NULL)) die(strerror(errno));
@@ -780,22 +708,6 @@ int main(int argc, char **argv)
 	if (repeat_fd < 0) die(strerror(errno));
 	font_init(FONT_PATTERN);
 	library_load();
-	for (i = 1; i < argc;) {
-		char *values[FieldCount] = {0};
-		if (!strcmp(argv[i], "--")) die("expected a cover path before --");
-		values[Art] = argv[i++];
-		char *base = strrchr(values[Art], '/');
-		values[Name] = base ? base + 1 : values[Art];
-		int index = library_append(values);
-		char *dot = strrchr(games[index].value[Name], '.');
-		if (dot && dot != games[index].value[Name]) *dot = 0;
-		if (i < argc && strcmp(argv[i], "--")) games[index].command = argv + i;
-		while (i < argc && strcmp(argv[i], "--")) ++i;
-		if (i < argc) {
-			argv[i++] = NULL;
-			if (i == argc) die("expected a cover path after --");
-		}
-	}
 	display = wl_display_connect(NULL);
 	if (!display) die("cannot connect to Wayland display");
 	xkb = xkb_context_new(XKB_CONTEXT_NO_FLAGS);

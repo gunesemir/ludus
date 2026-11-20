@@ -1,7 +1,7 @@
 # ludus
 
-A small Wayland game launcher written in C99. Pick a cover with the vi keys
-and press Enter to play.
+A small Wayland game library for oyna, written in C99. Pick a cover with the
+vi keys and press Enter to play.
 
 ## Build and run
 
@@ -20,29 +20,22 @@ to remove it. Set `PREFIX` on both commands to use another installation prefix.
 Ludus uses your system's `monospace` font. To change the font, colors, cover
 size, or keybindings, edit `config.h` and run `make` again.
 
-## Add a game
-
-Press `+`, give the game a name, and enter the full path to its executable.
-For a Windows game, set **Runner** to `wine`, `umu-run`, or the path to your
-runner. Leave it blank to launch a native game directly. You can add a JPEG
-or PNG cover now or later. A 600×900 image fits the grid.
-
-Use Tab and Shift+Tab to move between fields. Ctrl+V or Shift+Insert pastes
-at the cursor. Enter saves your changes and Escape cancels.
+## Controls
 
 | In the library | Key |
 | --- | --- |
 | Move left, down, up, right | `h`, `j`, `k`, `l` |
 | Launch the selected game | Enter |
-| Add or edit a game | `+` / `e` |
+| Edit the title or cover | `e` |
 | Search by title | `/` |
 | Next or previous match | `n` / `N` |
 | Quit | `q` |
 
 ## Oyna games
 
-Put your oyna config in `~/.ludus/` and use the game title as the filename.
-For example, save this as `~/.ludus/Black Mesa`:
+Put `oyna` on your `PATH`, then put your game configs in `~/.ludus/`.
+Use the game title as the filename. For example, save this as
+`~/.ludus/Black Mesa` with `art=` pointing to an optional JPEG or PNG cover.
 
 ```ini
 exe=/games/Black Mesa/bms.exe
@@ -52,52 +45,12 @@ arg=-novid
 art=/pictures/Black Mesa.jpg
 ```
 
-Put `oyna` on your `PATH`. Ludus uses the filename as the title, reads
-`art=` if present, and passes the file to `oyna --config` when you press Enter.
-Press `e` to rename the file or change its cover. Edit the runner settings
-and arguments in the file itself.
+Ludus passes the file to `oyna --config` when you press Enter. Edit launch
+settings and arguments in the file itself. Old `.meta` entries are skipped.
+See the [oyna config docs](https://github.com/gunesemir/oyna#config-files).
 
-To create one with `+`, enter `oyna` as the runner and give the executable,
-prefix, and Proton installation as absolute paths. Leave Working directory
-and Launch command blank. Oyna expects the game, prefix, and Proton paths
-to exist.
-
-## Other game files
-
-You can also edit games by hand. Each one has a file in `~/.ludus/`, with one
-`key=value` per line. Only `name` and either `exe` or `cmd` are required.
-If the file changes while the game editor is open, Ludus asks you to reopen
-the editor before saving. Here’s an example for `~/.ludus/Black Mesa.meta`.
-
-```ini
-name=Black Mesa
-exe=/games/Black Mesa/bms.exe
-workdir=/games/Black Mesa
-art=/pictures/Black Mesa.jpg
-runner=umu-run
-WINEPREFIX=/games/prefixes/black-mesa
-PROTONPATH=GE-Proton
-```
-
-Paths can contain spaces. Use absolute paths for the executable, artwork,
-prefix, and working directory. Leave `workdir` empty to inherit the directory
-where you started Ludus. Cover thumbnails are cached in `~/.ludus/cache/`.
-
-Use `cmd` for game arguments, environment variables, or wrappers. It runs in
-`/bin/sh`, where `"$@"` expands to the runner and executable you entered.
-For example, this starts the game with MangoHud and passes `-novid` to it.
-
-```ini
-cmd=exec mangohud "$@" -novid
-```
-
-To try a game without saving it, pass its cover and launch command on the
-command line. Separate games with `--`.
-
-```sh
-./ludus 'covers/Portal 2.jpg' steam -applaunch 620 -- covers/DOOM.png gzdoom
-```
-
-Saving one of these games with `e` also saves the directory you started it from.
+Press `e` to rename the file or change its cover. Use Tab to switch fields,
+Ctrl+V or Shift+Insert to paste, Enter to save, or Escape to cancel. A 600×900
+cover fits the grid. Thumbnails are cached in `~/.ludus/cache/`.
 
 The bundled `stb_image.h` (revision `5c20573`) includes its license.

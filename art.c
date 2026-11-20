@@ -77,10 +77,10 @@ void load_cover(struct game *g)
 	int w, h, channels, sw, sh, x, y;
 	unsigned char *src;
 	g->tried = 1;
-	if (!*g->value[Art]) return;
+	if (!*g->art) return;
 	struct stat st;
-	FILE *source = open_regular(g->value[Art], &st);
-	if (!source) { perror(g->value[Art]); return; }
+	FILE *source = open_regular(g->art, &st);
+	if (!source) { perror(g->art); return; }
 	struct stamp stamp = {st.st_size, st.st_ctim.tv_sec, st.st_ctim.tv_nsec};
 	char cache[PATH_MAX] = "";
 	size_t bytes = (size_t)COVER_WIDTH * CoverHeight * sizeof(uint32_t);
@@ -104,7 +104,7 @@ void load_cover(struct game *g)
 	src = stbi_load_from_file(source, &w, &h, &channels, 4);
 	fclose(source);
 	if (!src) {
-		fprintf(stderr, "ludus: %s: %s\n", g->value[Art], stbi_failure_reason());
+		fprintf(stderr, "ludus: %s: %s\n", g->art, stbi_failure_reason());
 		return;
 	}
 	g->thumbnail = malloc(bytes);

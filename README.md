@@ -27,7 +27,7 @@ size, or keybindings, edit `config.h` and run `make` again.
 | Move left, down, up, right | `h`, `j`, `k`, `l` |
 | Launch the selected game | Enter |
 | Edit the selected config in `$EDITOR` | `e` |
-| Add a game config in `$EDITOR` | `+` |
+| Name and add a game | `+` |
 | Search by title | `/` |
 | Next or previous match | `n` / `N` |
 | Quit | `q` |
@@ -49,9 +49,11 @@ art=/pictures/Black Mesa.jpg
 Ludus passes the file to `oyna --config` when you press Enter.
 See the [oyna config docs](https://github.com/gunesemir/oyna#config-files).
 
-Press `+` to open a new config template. Fill it in and save it under your
-game's title in `~/.oyna/`. Press `e` to edit an existing config. Ludus hides
-the grid while you edit and restores it when the editor exits.
+Press `+`, type the game's title in the bottom bar, and press Enter. Ludus
+opens a config template in `$EDITOR` with the title as its filename in
+`~/.oyna/`. Fill in the paths and save the file. Escape cancels the name
+prompt. Press `e` to edit an existing config. Ludus hides the grid while you
+edit and restores it when the editor exits.
 
 Set `EDITOR` to your editor, for example `EDITOR=nvim`. Ludus uses its
 foreground terminal if it has one. Otherwise it uses `xdg-terminal-exec`

@@ -17,7 +17,7 @@ extern int count;
 void load_cover(struct game *g);
 int library_load(int selected, const char *preferred);
 void library_finish(void);
-int library_draft(char *path, struct stat *revision);
+int library_draft(const char *name, char *path, struct stat *revision);
 void library_discard_draft(const char *path, const struct stat *revision);
 int game_launch(struct game *g);
 #endif

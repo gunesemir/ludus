@@ -176,26 +176,24 @@ int library_load(int selected, const char *preferred)
 	return selected < count ? selected : count ? count - 1 : 0;
 }
 
-int library_draft(char *path, struct stat *revision)
+int library_draft(const char *name, char *path, struct stat *revision)
 {
 	const char template[] =
-		"# Save this file under the game title in ~/.oyna/.\n"
 		"exe=\n"
+		"art=\n"
 		"WINEPREFIX=\n"
-		"PROTONPATH=\n"
-		"art=\n";
+		"PROTONPATH=\n\n"
+		"# Optional\n"
+		"#GAMEID=\n"
+		"#STORE=\n"
+		"#arg=\n";
+	if (!valid_name(name) || !name[strspn(name, " ")]) { errno = EINVAL; return -1; }
 	if (!*dir) { errno = ENOENT; return -1; }
+	if (join(path, dir, name)) return -1;
 	if (mkdir(dir, 0700) && errno != EEXIST) return -1;
 
-	int fd;
-	for (unsigned i = 1; ; ++i) {
-		char name[32] = "New game";
-		if (i > 1) snprintf(name, sizeof name, "New game %u", i);
-		if (join(path, dir, name)) return -1;
-		fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
-		if (fd >= 0) break;
-		if (errno != EEXIST) return -1;
-	}
+	int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+	if (fd < 0) return -1;
 	FILE *f = fdopen(fd, "w");
 	int error = 0;
 	if (!f) { error = errno; close(fd); }

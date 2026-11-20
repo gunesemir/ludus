@@ -52,9 +52,10 @@ static struct view main_view = { .width = 900, .height = 640 };
 static struct wl_surface *focus;
 static int selected, first_row, running = 1, active;
 static char status[PATH_MAX + 128];
-static int searching, search_origin, found;
-static char query[PATH_MAX];
-static size_t query_cursor;
+static enum { NoPrompt, SearchPrompt, NamePrompt } prompt_mode;
+static int search_origin, found;
+static char query[PATH_MAX], game_name[PATH_MAX], prompt_error[160];
+static size_t input_cursor;
 static int submit_after_paste;
 extern char **environ;
 static pid_t editor_pid;
@@ -145,19 +146,25 @@ static void paint(struct canvas c)
 	cached_begin = begin;
 	cached_end = end;
 	fill(c, 0, bar, width, Footer, BAR_BACKGROUND);
-	if (searching) {
-		const char *match = found ? games[selected].name : "No match";
-		char prompt[sizeof query + 2];
-		snprintf(prompt, sizeof prompt, "/%s", query);
-		int edge = width / 2;
-		char saved = prompt[1 + query_cursor];
-		prompt[1 + query_cursor] = 0;
+	if (prompt_mode != NoPrompt) {
+		int search = prompt_mode == SearchPrompt;
+		const char *label = search ? "/" : "Game name: ";
+		const char *value = search ? query : game_name;
+		const char *message = search ? (found ? games[selected].name : "No match") : prompt_error;
+		int edge = search ? width / 2 : right;
+		if (!search && *message) edge -= text_width(STATUS_FONT_SIZE, message) + 4;
+		if (edge < width / 3) edge = width / 3;
+		char prompt[PATH_MAX + sizeof "Game name: "];
+		snprintf(prompt, sizeof prompt, "%s%s", label, value);
+		size_t caret_pos = strlen(label) + input_cursor;
+		char saved = prompt[caret_pos];
+		prompt[caret_pos] = 0;
 		int caret = text_width(STATUS_FONT_SIZE, prompt);
-		prompt[1 + query_cursor] = saved;
+		prompt[caret_pos] = saved;
 		int start = caret + 8 < edge ? 6 : edge - caret - 2;
 		text(c, start, bar + STATUS_FONT_SIZE + 1, 6, edge, STATUS_FONT_SIZE, 0xffffff, prompt);
 		fill(c, start + caret, bar + 3, 1, STATUS_FONT_SIZE, BORDER_COLOR);
-		text(c, edge + 6, bar + STATUS_FONT_SIZE + 1, edge + 6, right, STATUS_FONT_SIZE, 0xffffff, match);
+		if (*message) text(c, edge + 4, bar + STATUS_FONT_SIZE + 1, edge + 4, right, STATUS_FONT_SIZE, 0xffffff, message);
 		return;
 	}
 	text(c, 6, bar + STATUS_FONT_SIZE + 1, 0, split - 4, STATUS_FONT_SIZE, 0xffffff,
@@ -290,20 +297,6 @@ static int find_title(int start, int direction)
 	return 0;
 }
 
-static void search_key(xkb_keysym_t sym, uint32_t code)
-{
-	main_view.dirty = 1;
-	if (sym == XKB_KEY_Escape || sym == XKB_KEY_Return || sym == XKB_KEY_KP_Enter) {
-		clipboard_cancel();
-		if (!found || sym == XKB_KEY_Escape) selected = search_origin;
-		searching = 0;
-		if (sym == XKB_KEY_Escape) query[0] = 0;
-		return;
-	}
-	edit_line(query, &query_cursor, sym, code);
-	found = find_title(search_origin, 1);
-}
-
 static void ignore_terminal_signal(int sig)
 {
 	(void)sig;
@@ -354,24 +347,28 @@ static int spawn_terminal(char *command, const char *path)
 	return posix_spawnp(&editor_pid, args[0], NULL, NULL, args, environ);
 }
 
-static void start_editor(const char *path)
+static void start_editor(const char *path, const char *name)
 {
 	if (editor_pid) return;
 	main_view.dirty = 1;
 	const char *editor = getenv("EDITOR");
+	char *message = name ? prompt_error : status;
+	size_t capacity = name ? sizeof prompt_error : sizeof status;
 	char command[PATH_MAX];
 	if (!editor || !*editor) {
-		strcpy(status, "Set EDITOR to edit game configs");
+		strcpy(message, "Set EDITOR to edit game configs");
 		return;
 	}
 	/* The editor command can contain options. The filename is a separate argument. */
 	if (snprintf(command, sizeof command, "exec %s \"$1\"", editor) >= (int)sizeof command) {
-		strcpy(status, "EDITOR command is too long");
+		strcpy(message, "EDITOR command is too long");
 		return;
 	}
-	if (!path) {
-		if (library_draft(editor_draft, &draft_revision)) {
-			snprintf(status, sizeof status, "Cannot create game config: %s", strerror(errno));
+	if (name) {
+		if (library_draft(name, editor_draft, &draft_revision)) {
+			if (errno == EEXIST) strcpy(message, "A config with that name exists");
+			else if (errno == EINVAL) strcpy(message, "Enter a valid filename");
+			else snprintf(message, capacity, "Cannot create config: %s", strerror(errno));
 			editor_draft[0] = 0;
 			return;
 		}
@@ -396,15 +393,38 @@ static void start_editor(const char *path)
 		editor_draft[0] = 0;
 		editor_pid = 0;
 		if (tty < 0 && error == ENOENT)
-			strcpy(status, "Set TERMINAL or install xdg-terminal-exec");
+			strcpy(message, "Set TERMINAL or install xdg-terminal-exec");
 		else
-			snprintf(status, sizeof status, "Cannot start %s: %s",
+			snprintf(message, capacity, "Cannot start %s: %s",
 			         tty >= 0 ? "editor" : "terminal", strerror(error));
 		show_view();
 		return;
 	}
 	editor_tty = tty;
+	prompt_mode = NoPrompt;
 	status[0] = 0;
+}
+
+static void prompt_key(xkb_keysym_t sym, uint32_t code)
+{
+	main_view.dirty = 1;
+	int cancel = sym == XKB_KEY_Escape;
+	int search = prompt_mode == SearchPrompt;
+	if (cancel || sym == XKB_KEY_Return || sym == XKB_KEY_KP_Enter) {
+		clipboard_cancel();
+		if (!search && !cancel) {
+			if (*game_name) start_editor(NULL, game_name);
+			else strcpy(prompt_error, "Enter a game name");
+			return;
+		}
+		if (search && (!found || cancel)) selected = search_origin;
+		if (search && cancel) query[0] = 0;
+		prompt_mode = NoPrompt;
+		return;
+	}
+	edit_line(search ? query : game_name, &input_cursor, sym, code);
+	if (search) found = find_title(search_origin, 1);
+	else prompt_error[0] = 0;
 }
 
 static void editor_finished(int result)
@@ -420,10 +440,6 @@ static void editor_finished(int result)
 	if (*editor_draft) library_discard_draft(editor_draft, &draft_revision);
 	selected = library_load(selected, editor_draft);
 	editor_draft[0] = 0;
-	if (searching) {
-		search_origin = selected;
-		found = find_title(search_origin, 1);
-	}
 	if (WIFSIGNALED(result))
 		snprintf(status, sizeof status, "Editor stopped (signal %d)", WTERMSIG(result));
 	else if (WIFEXITED(result) && WEXITSTATUS(result))
@@ -454,13 +470,20 @@ static void press(xkb_keysym_t sym)
 {
 	int col = columns(), old = selected;
 	if (sym == KEY_QUIT) running = 0;
-	if (sym == KEY_ADD || sym == XKB_KEY_KP_Add) { start_editor(NULL); return; }
+	if (sym == KEY_ADD || sym == XKB_KEY_KP_Add) {
+		game_name[0] = prompt_error[0] = 0;
+		input_cursor = 0;
+		prompt_mode = NamePrompt;
+		main_view.dirty = 1;
+		return;
+	}
 	if (sym == KEY_SEARCH) {
 		search_origin = selected;
 		query[0] = 0;
-		query_cursor = 0;
+		input_cursor = 0;
 		found = count > 0;
-		searching = main_view.dirty = 1;
+		prompt_mode = SearchPrompt;
+		main_view.dirty = 1;
 		return;
 	}
 	if (!count) return;
@@ -470,7 +493,7 @@ static void press(xkb_keysym_t sym)
 		main_view.dirty = 1;
 		return;
 	}
-	if (sym == KEY_EDIT) { start_editor(games[selected].path); return; }
+	if (sym == KEY_EDIT) { start_editor(games[selected].path, NULL); return; }
 	if (sym == KEY_LEFT && selected % col > 0) --selected;
 	if (sym == KEY_RIGHT && selected % col < col - 1 && selected + 1 < count) ++selected;
 	if (sym == KEY_UP && selected >= col) selected -= col;
@@ -530,7 +553,7 @@ static int handle_press(uint32_t code)
 {
 	xkb_keysym_t sym = xkb_state_key_get_one_sym(keys, code);
 	if (!main_view.surface || focus != main_view.surface) return 0;
-	if (searching) {
+	if (prompt_mode != NoPrompt) {
 		int submit = sym == XKB_KEY_Return || sym == XKB_KEY_KP_Enter;
 		if (submit && clipboard_fd() >= 0) {
 			submit_after_paste = 1;
@@ -542,7 +565,7 @@ static int handle_press(uint32_t code)
 			clipboard_receive();
 			return 0;
 		}
-		search_key(sym, code);
+		prompt_key(sym, code);
 		return !submit && sym != XKB_KEY_Escape && sym != XKB_KEY_Tab && sym != XKB_KEY_ISO_Left_Tab;
 	}
 	press(sym);
@@ -684,10 +707,12 @@ static void finish_paste(void)
 	if (clipboard_fd() >= 0) return;
 	int submit = submit_after_paste;
 	submit_after_paste = 0;
-	if (searching) {
-		if (s && insert_text(query, &query_cursor, s)) {
-			found = find_title(search_origin, 1);
-			if (submit) search_key(XKB_KEY_Return, 0);
+	if (prompt_mode != NoPrompt) {
+		int search = prompt_mode == SearchPrompt;
+		if (s && insert_text(search ? query : game_name, &input_cursor, s)) {
+			if (search) found = find_title(search_origin, 1);
+			else prompt_error[0] = 0;
+			if (submit) prompt_key(XKB_KEY_Return, 0);
 		}
 		main_view.dirty = 1;
 	}

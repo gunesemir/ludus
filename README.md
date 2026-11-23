@@ -1,68 +1,75 @@
-# ludus
+# Ludus
 
-A small Wayland game library for oyna, written in C99. Pick a cover with the
-vi keys and press Enter to play.
+Ludus is a keyboard-driven Wayland library for [oyna]. Each game is an oyna
+config in `~/.oyna/`. The filename is the title shown in the cover grid.
 
-## Build and run
+## Get started
 
-You'll need a C compiler, make, pkg-config, wayland-scanner, wayland-protocols,
-and the development packages for wayland-client, xkbcommon, Fontconfig, and
-FreeType. Build and start Ludus from a Wayland session.
+Build with a C99 compiler, make, pkg-config, wayland-scanner, wayland-protocols,
+and the development packages for Wayland client, xkbcommon, Fontconfig, and
+FreeType. Put `oyna` on your `PATH` and run these in a Wayland session.
 
 ```sh
 make
 ./ludus
 ```
 
-Use `make install` to install Ludus in `/usr/local/bin` and `make uninstall`
-to remove it. Set `PREFIX` on both commands to use another installation prefix.
+`make install` copies the binary to `/usr/local/bin`. Use `make uninstall`
+to remove it or set `PREFIX` on both commands to use a different prefix.
 
-Ludus uses your system's `monospace` font. To change the font, colors, cover
-size, or keybindings, edit `config.h` and run `make` again.
+## Add a game
 
-## Controls
-
-| In the library | Key |
-| --- | --- |
-| Move left, down, up, right | `h`, `j`, `k`, `l` |
-| Launch the selected game | Enter |
-| Edit the selected config in `$EDITOR` | `e` |
-| Name and add a game | `+` |
-| Search by title | `/` |
-| Next or previous match | `n` / `N` |
-| Quit | `q` |
-
-## Oyna games
-
-Put `oyna` on your `PATH`, then put your game configs in `~/.oyna/`.
-Use the game title as the filename. For example, save this as
-`~/.oyna/Black Mesa` with `art=` pointing to an optional JPEG or PNG cover.
+Press `+`, type a title, and press Enter. Ludus opens a template in `$EDITOR`.
+Fill in the paths and save. For example, `~/.oyna/Black Mesa` could contain
 
 ```ini
 exe=/games/Black Mesa/bms.exe
+art=/pictures/Black Mesa.jpg
 WINEPREFIX=/games/prefixes/black-mesa
 PROTONPATH=/games/proton/GE-Proton
 arg=-novid
-art=/pictures/Black Mesa.jpg
 ```
 
-Ludus passes the file to `oyna --config` when you press Enter.
-See the [oyna config docs](https://github.com/gunesemir/oyna#config-files).
+`art=` is optional. Use a JPEG or PNG for the cover. Ludus caches thumbnails
+in `~/.cache/ludus/`. Oyna handles launch settings and game arguments.
+See the [oyna config documentation][oyna-config].
 
-Press `+`, type the game's title in the bottom bar, and press Enter. Ludus
-opens a config template in `$EDITOR` with the title as its filename in
-`~/.oyna/`. Fill in the paths and save the file. Escape cancels the name
-prompt. Press `e` to edit an existing config. Ludus hides the grid while you
-edit and restores it when the editor exits.
+## Keys
 
-Set `EDITOR` to your editor, for example `EDITOR=nvim`. Ludus uses its
-foreground terminal if it has one. Otherwise it uses `xdg-terminal-exec`
-or the command in `TERMINAL` if set. Include any flags your terminal needs
-to run a command and wait for it to finish, for example
-`TERMINAL='alacritty -e'`. Editors that detach need a wait flag, such as
-`EDITOR='code --wait'`.
+| Key | Action |
+| --- | --- |
+| `h`, `j`, `k`, `l` | Move left, down, up, right |
+| Enter | Play the selected game |
+| `+` | Add a config |
+| `e` | Edit the config |
+| `R` | Rename the config and its title |
+| `d` | Move the config to trash after confirmation |
+| `r` | Rescan `~/.oyna/` |
+| `/` | Search titles |
+| `n`, `N` | Next or previous match |
+| `L` | Open the selected game's last launch log |
+| `q` | Quit |
 
-A 600×900 cover fits the grid. Thumbnails are cached in `~/.cache/ludus/`.
+Enter confirms a prompt and Escape cancels it. Removed configs are kept
+under `~/.oyna/.trash/` and can be moved back into `~/.oyna/`.
+
+If oyna exits with an error, the bottom bar shows its last diagnostic.
+`L` opens the full stderr log for the selected game's most recent launch
+in the current Ludus session.
+
+## Editor and appearance
+
+Set `EDITOR` to a command such as `nvim`. Ludus hands it the foreground
+terminal, or opens a terminal through your `TERMINAL` command or
+`xdg-terminal-exec`. Use a terminal and editor command that wait until
+you close the file, such as `EDITOR='code --wait'` for VS Code.
+Ludus returns to the grid when the command exits.
+
+Edit `config.h` and rebuild to change the keys, colors, cover size, or
+font. The default font is your system's monospace face.
 
 Ludus is licensed under [0BSD](LICENSE). The bundled `stb_image.h`
 (revision `5c20573`) includes its license.
+
+[oyna]: https://github.com/gunesemir/oyna
+[oyna-config]: https://github.com/gunesemir/oyna#save-per-game-settings

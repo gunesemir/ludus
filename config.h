@@ -21,6 +21,10 @@
 #define KEY_LAUNCH        XKB_KEY_Return
 #define KEY_ADD           XKB_KEY_plus
 #define KEY_EDIT          XKB_KEY_e
+#define KEY_REFRESH       XKB_KEY_r
+#define KEY_RENAME        XKB_KEY_R
+#define KEY_REMOVE        XKB_KEY_d
+#define KEY_LOG           XKB_KEY_L
 #define KEY_QUIT          XKB_KEY_q
 #define KEY_SEARCH        XKB_KEY_slash
 #define KEY_NEXT_MATCH    XKB_KEY_n

@@ -40,9 +40,14 @@ static int valid_name(const char *name)
 	       (len < 5 || strcmp(name + len - 5, ".meta"));
 }
 
+static int same_file(const struct stat *a, const struct stat *b)
+{
+	return a->st_dev == b->st_dev && a->st_ino == b->st_ino;
+}
+
 static int same_revision(const struct stat *a, const struct stat *b)
 {
-	return a->st_dev == b->st_dev && a->st_ino == b->st_ino && a->st_size == b->st_size &&
+	return same_file(a, b) && a->st_size == b->st_size &&
 	       a->st_mtim.tv_sec == b->st_mtim.tv_sec && a->st_mtim.tv_nsec == b->st_mtim.tv_nsec;
 }
 
@@ -125,6 +130,10 @@ static void free_games(struct game *list, int length)
 		free(list[i].path);
 		free(list[i].thumbnail);
 		free(list[i].art);
+		if (list[i].log) {
+			unlink(list[i].log);
+			free(list[i].log);
+		}
 	}
 	free(list);
 }
@@ -139,8 +148,8 @@ int library_load(int selected, const char *preferred)
 
 	struct game *old = games;
 	int old_count = count;
-	const char *previous = selected < old_count ? old[selected].path : "";
-	int previous_index = -1, preferred_index = -1;
+	const struct game *previous = selected < old_count ? &old[selected] : NULL;
+	int previous_index = -1, moved_index = -1, preferred_index = -1;
 	games = NULL;
 	count = 0;
 	for (int i = 0; i < n; ++i) {
@@ -154,18 +163,21 @@ int library_load(int selected, const char *preferred)
 	if (n >= 0) free(entries);
 
 	for (int i = 0; i < count; ++i) {
-		if (!strcmp(previous, games[i].path)) previous_index = i;
+		if (previous) {
+			if (!strcmp(previous->path, games[i].path)) previous_index = i;
+			else if (same_file(&previous->revision, &games[i].revision)) moved_index = i;
+		}
 		if (preferred && !strcmp(preferred, games[i].path)) preferred_index = i;
 	}
 	for (int j = 0; j < old_count; ++j) {
-		if (!old[j].pid) continue;
+		if (!old[j].pid && !old[j].log) continue;
 		for (int i = 0; i < count; ++i) {
 			struct game *g = &games[i];
-			if (g->pid) continue;
-			if (!strcmp(old[j].path, g->path) ||
-			    (old[j].revision.st_dev == g->revision.st_dev &&
-			     old[j].revision.st_ino == g->revision.st_ino)) {
+			if (g->pid || g->log) continue;
+			if (!strcmp(old[j].path, g->path) || same_file(&old[j].revision, &g->revision)) {
 				g->pid = old[j].pid;
+				g->log = old[j].log;
+				old[j].log = NULL;
 				break;
 			}
 		}
@@ -173,6 +185,7 @@ int library_load(int selected, const char *preferred)
 	free_games(old, old_count);
 	if (preferred_index >= 0) return preferred_index;
 	if (previous_index >= 0) return previous_index;
+	if (moved_index >= 0) return moved_index;
 	return selected < count ? selected : count ? count - 1 : 0;
 }
 
@@ -211,6 +224,39 @@ void library_discard_draft(const char *path, const struct stat *revision)
 	if (!lstat(path, &current) && same_revision(revision, &current)) unlink(path);
 }
 
+static int check_config(const struct game *g)
+{
+	struct stat current;
+	if (lstat(g->path, &current)) return -1;
+	if (!S_ISREG(current.st_mode) || !same_file(&current, &g->revision)) {
+		errno = ESTALE;
+		return -1;
+	}
+	return 0;
+}
+
+int library_rename(const struct game *g, const char *name, char *path)
+{
+	if (!valid_name(name) || !name[strspn(name, " ")]) { errno = EINVAL; return -1; }
+	if (join(path, dir, name) || check_config(g)) return -1;
+	if (!strcmp(g->path, path)) return 0;
+	return renameat2(AT_FDCWD, g->path, AT_FDCWD, path, RENAME_NOREPLACE);
+}
+
+int library_remove(const struct game *g)
+{
+	char trash[PATH_MAX], slot[PATH_MAX], path[PATH_MAX];
+	if (check_config(g) || join(trash, dir, ".trash") ||
+	    join(slot, trash, "removed-XXXXXX")) return -1;
+	if (mkdir(trash, 0700) && errno != EEXIST) return -1;
+	if (!mkdtemp(slot)) return -1;
+	if (!join(path, slot, g->name) && !rename(g->path, path)) return 0;
+	int error = errno;
+	rmdir(slot);
+	errno = error;
+	return -1;
+}
+
 void library_finish(void)
 {
 	free_games(games, count);
@@ -220,8 +266,54 @@ int game_launch(struct game *g)
 {
 	if (g->pid) return EALREADY;
 	char *args[] = {"oyna", "--config", g->path, NULL};
+	char path[] = "/tmp/ludus-launch-XXXXXX";
+	int fd = mkostemp(path, O_CLOEXEC);
 	pid_t pid;
-	int error = posix_spawnp(&pid, args[0], NULL, NULL, args, environ);
+	int error;
+	if (fd < 0) {
+		error = posix_spawnp(&pid, args[0], NULL, NULL, args, environ);
+	} else {
+		posix_spawn_file_actions_t io;
+		error = posix_spawn_file_actions_init(&io);
+		if (!error) {
+			error = posix_spawn_file_actions_adddup2(&io, fd, STDERR_FILENO);
+			if (!error) error = posix_spawnp(&pid, args[0], &io, NULL, args, environ);
+			posix_spawn_file_actions_destroy(&io);
+		}
+		if (error) dprintf(fd, "Cannot start oyna: %s\n", strerror(error));
+		close(fd);
+	}
+	if (g->log) { unlink(g->log); free(g->log); }
+	g->log = fd < 0 ? NULL : copy(path);
 	if (!error) g->pid = pid;
 	return error;
+}
+
+void game_error(const struct game *g, char *message, size_t capacity)
+{
+	message[0] = 0;
+	if (!g->log) return;
+	int fd = open(g->log, O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW);
+	if (fd < 0) return;
+	char tail[4096];
+	off_t end = lseek(fd, 0, SEEK_END);
+	off_t start = end > (off_t)sizeof tail ? end - (off_t)sizeof tail : 0;
+	ssize_t n = end > 0 ? pread(fd, tail, sizeof tail, start) : 0;
+	close(fd);
+	if (n <= 0) return;
+	while (n && (unsigned char)tail[n - 1] <= ' ') --n;
+	ssize_t line = n;
+	while (line && tail[line - 1] != '\n' && tail[line - 1] != '\r') --line;
+	size_t used = 0;
+	for (; line < n && used + 1 < capacity; ++line) {
+		unsigned char ch = tail[line];
+		if (ch == 27 && line + 1 < n && tail[line + 1] == '[') {
+			line += 2;
+			while (line < n && (tail[line] < '@' || tail[line] > '~')) ++line;
+			continue;
+		}
+		if (ch >= ' ' && ch != 127) message[used++] = ch;
+		else if (ch == '\t') message[used++] = ' ';
+	}
+	message[used] = 0;
 }

@@ -52,7 +52,7 @@ static struct view main_view = { .width = 900, .height = 640 };
 static struct wl_surface *focus;
 static int selected, first_row, running = 1, active;
 static char status[PATH_MAX + 128];
-static enum { NoPrompt, SearchPrompt, NamePrompt } prompt_mode;
+static enum { NoPrompt, SearchPrompt, NamePrompt, RenamePrompt, RemovePrompt } prompt_mode;
 static int search_origin, found;
 static char query[PATH_MAX], game_name[PATH_MAX], prompt_error[160];
 static size_t input_cursor;
@@ -146,9 +146,15 @@ static void paint(struct canvas c)
 	cached_begin = begin;
 	cached_end = end;
 	fill(c, 0, bar, width, Footer, BAR_BACKGROUND);
+	if (prompt_mode == RemovePrompt) {
+		char confirm[PATH_MAX + 32];
+		snprintf(confirm, sizeof confirm, "Enter to remove %s", games[selected].name);
+		text(c, 6, bar + STATUS_FONT_SIZE + 1, 6, right, STATUS_FONT_SIZE, 0xffffff, confirm);
+		return;
+	}
 	if (prompt_mode != NoPrompt) {
 		int search = prompt_mode == SearchPrompt;
-		const char *label = search ? "/" : "Game name: ";
+		const char *label = search ? "/" : prompt_mode == RenamePrompt ? "Rename to: " : "Game name: ";
 		const char *value = search ? query : game_name;
 		const char *message = search ? (found ? games[selected].name : "No match") : prompt_error;
 		int edge = search ? width / 2 : right;
@@ -405,6 +411,33 @@ static void start_editor(const char *path, const char *name)
 	status[0] = 0;
 }
 
+static void rename_selected(void)
+{
+	char path[PATH_MAX];
+	if (library_rename(&games[selected], game_name, path)) {
+		if (errno == EEXIST) strcpy(prompt_error, "A config with that name exists");
+		else if (errno == EINVAL) strcpy(prompt_error, "Enter a valid filename");
+		else if (errno == ESTALE || errno == ENOENT) strcpy(prompt_error, "Config changed. Esc, then r");
+		else snprintf(prompt_error, sizeof prompt_error, "Cannot rename config: %s", strerror(errno));
+		return;
+	}
+	prompt_mode = NoPrompt;
+	snprintf(status, sizeof status, "Renamed to %s", game_name);
+	selected = library_load(selected, path);
+}
+
+static void remove_selected(void)
+{
+	prompt_mode = NoPrompt;
+	if (library_remove(&games[selected])) {
+		if (errno == ESTALE || errno == ENOENT) strcpy(status, "Config changed. Press r to refresh");
+		else snprintf(status, sizeof status, "Cannot remove config: %s", strerror(errno));
+		return;
+	}
+	snprintf(status, sizeof status, "Removed %s", games[selected].name);
+	selected = library_load(selected, NULL);
+}
+
 static void prompt_key(xkb_keysym_t sym, uint32_t code)
 {
 	main_view.dirty = 1;
@@ -413,7 +446,9 @@ static void prompt_key(xkb_keysym_t sym, uint32_t code)
 	if (cancel || sym == XKB_KEY_Return || sym == XKB_KEY_KP_Enter) {
 		clipboard_cancel();
 		if (!search && !cancel) {
-			if (*game_name) start_editor(NULL, game_name);
+			if (prompt_mode == RemovePrompt) remove_selected();
+			else if (prompt_mode == RenamePrompt) rename_selected();
+			else if (*game_name) start_editor(NULL, game_name);
 			else strcpy(prompt_error, "Enter a game name");
 			return;
 		}
@@ -457,9 +492,16 @@ static void reap(void)
 		for (int i = 0; i < count; ++i) {
 			if (games[i].pid != pid) continue;
 			games[i].pid = 0;
-			snprintf(status, sizeof status, "Stopped %s", games[i].name);
-			if (WIFEXITED(result) && WEXITSTATUS(result))
-				snprintf(status, sizeof status, "Stopped %s (exit %d)", games[i].name, WEXITSTATUS(result));
+			if (WIFEXITED(result) && !WEXITSTATUS(result)) {
+				snprintf(status, sizeof status, "Stopped %s", games[i].name);
+			} else {
+				char message[sizeof status - sizeof "Launch failed: "];
+				game_error(&games[i], message, sizeof message);
+				if (*message) snprintf(status, sizeof status, "Launch failed: %s", message);
+				else if (WIFSIGNALED(result))
+					snprintf(status, sizeof status, "%s stopped (signal %d)", games[i].name, WTERMSIG(result));
+				else snprintf(status, sizeof status, "%s failed (exit %d)", games[i].name, WEXITSTATUS(result));
+			}
 			main_view.dirty = 1;
 			break;
 		}
@@ -470,6 +512,11 @@ static void press(xkb_keysym_t sym)
 {
 	int col = columns(), old = selected;
 	if (sym == KEY_QUIT) running = 0;
+	if (sym == KEY_REFRESH) {
+		selected = library_load(selected, NULL);
+		main_view.dirty = 1;
+		return;
+	}
 	if (sym == KEY_ADD || sym == XKB_KEY_KP_Add) {
 		game_name[0] = prompt_error[0] = 0;
 		input_cursor = 0;
@@ -487,6 +534,24 @@ static void press(xkb_keysym_t sym)
 		return;
 	}
 	if (!count) return;
+	if (sym == KEY_RENAME) {
+		snprintf(game_name, sizeof game_name, "%s", games[selected].name);
+		input_cursor = strlen(game_name);
+		prompt_error[0] = 0;
+		prompt_mode = RenamePrompt;
+		main_view.dirty = 1;
+		return;
+	}
+	if (sym == KEY_REMOVE) {
+		prompt_mode = RemovePrompt;
+		main_view.dirty = 1;
+		return;
+	}
+	if (sym == KEY_LOG) {
+		if (games[selected].log) start_editor(games[selected].log, NULL);
+		else { strcpy(status, "No launch log for this game"); main_view.dirty = 1; }
+		return;
+	}
 	if (*query && (sym == KEY_NEXT_MATCH || sym == KEY_PREV_MATCH)) {
 		int direction = sym == KEY_NEXT_MATCH ? 1 : -1;
 		find_title(selected + direction, direction);
@@ -553,6 +618,11 @@ static int handle_press(uint32_t code)
 {
 	xkb_keysym_t sym = xkb_state_key_get_one_sym(keys, code);
 	if (!main_view.surface || focus != main_view.surface) return 0;
+	if (prompt_mode == RemovePrompt) {
+		if (sym == XKB_KEY_Escape || sym == XKB_KEY_Return || sym == XKB_KEY_KP_Enter)
+			prompt_key(sym, code);
+		return 0;
+	}
 	if (prompt_mode != NoPrompt) {
 		int submit = sym == XKB_KEY_Return || sym == XKB_KEY_KP_Enter;
 		if (submit && clipboard_fd() >= 0) {

@@ -20,13 +20,14 @@ to remove it or set `PREFIX` on both commands to use a different prefix.
 ## Add a game
 
 Press `+`, type a title, and press Enter. Ludus opens a template in `$EDITOR`.
-Fill in the paths and save. For example, `~/.oyna/Black Mesa` could contain
+The template uses the title for the prefix and defaults to GE-Proton. Fill in
+the executable path and save. For example, `~/.oyna/Black Mesa` could contain
 
 ```ini
 exe=/games/Black Mesa/bms.exe
 art=/pictures/Black Mesa.jpg
-WINEPREFIX=/games/prefixes/black-mesa
-PROTONPATH=/games/proton/GE-Proton
+WINEPREFIX=~/.oyna/prefix/Black Mesa
+PROTONPATH=~/.oyna/proton/GE-Proton
 arg=-novid
 ```
 
@@ -39,6 +40,8 @@ See the [oyna config documentation][oyna-config].
 | Key | Action |
 | --- | --- |
 | `h`, `j`, `k`, `l` | Move left, down, up, right |
+| `gg`, `G` | Jump to the first or last game |
+| `?` | Show shortcuts. Press `?` or Escape to close |
 | Enter | Play the selected game |
 | `+` | Add a config |
 | `e` | Edit the config |
@@ -63,7 +66,8 @@ Set `EDITOR` to a command such as `nvim`. Ludus hands it the foreground
 terminal, or opens a terminal through your `TERMINAL` command or
 `xdg-terminal-exec`. Use a terminal and editor command that wait until
 you close the file, such as `EDITOR='code --wait'` for VS Code.
-Ludus returns to the grid when the command exits.
+Ludus returns to the grid and reports whether the config changed. If a saved
+config is missing a required value, press `e` to reopen it or Escape to dismiss.
 
 Edit `config.h` and rebuild to change the keys, colors, cover size, or
 font. The default font is your system's monospace face.

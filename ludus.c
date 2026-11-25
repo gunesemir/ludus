@@ -31,7 +31,7 @@
 enum {
 	CoverHeight = COVER_WIDTH * 3 / 2,
 	TitleLines = 3,
-	TileHeight = CoverHeight + 6 + TitleLines * (FONT_SIZE + 3),
+	TileHeight = CoverHeight + 6 + TitleLines * (TITLE_FONT_SIZE + 3),
 	Header = HEADER_FONT_SIZE + 20,
 	Footer = STATUS_FONT_SIZE + 6
 };
@@ -52,8 +52,9 @@ static struct view main_view = { .width = 900, .height = 640 };
 static struct wl_surface *focus;
 static int selected, first_row, running = 1, active;
 static char status[PATH_MAX + 128];
-static enum { NoPrompt, SearchPrompt, NamePrompt, RenamePrompt, RemovePrompt } prompt_mode;
+static enum { NoPrompt, SearchPrompt, NamePrompt, RenamePrompt, RemovePrompt, RepairPrompt } prompt_mode;
 static int search_origin, found;
+static int first_key_pending, help_page;
 static char query[PATH_MAX], game_name[PATH_MAX], prompt_error[160];
 static size_t input_cursor;
 static int submit_after_paste;
@@ -63,7 +64,11 @@ static int editor_tty = -1;
 static struct termios editor_termios;
 static const int editor_signals[] = {SIGINT, SIGQUIT};
 static struct sigaction editor_handlers[sizeof editor_signals / sizeof *editor_signals];
-static char editor_draft[PATH_MAX];
+enum editor_action { AddConfig, EditConfig, ViewLog };
+static enum editor_action editor_action;
+static char editor_config[PATH_MAX];
+static uint64_t previous_hash;
+static char repair_message[PATH_MAX + 128];
 static struct stat draft_revision;
 static struct wl_display *display;
 static struct wl_compositor *compositor;
@@ -99,8 +104,73 @@ static int columns(void)
 	return n > 0 ? n : 1;
 }
 
+/* Prefer the character on the keycap, then fall back to its XKB name. */
+static void key_label(xkb_keysym_t sym, char label[64])
+{
+	if (sym == XKB_KEY_Return) { strcpy(label, "Enter"); return; }
+	if (xkb_keysym_to_utf8(sym, label, 64) > 1 && (unsigned char)label[0] > ' ' &&
+	    (unsigned char)label[0] != 127) return;
+	if (xkb_keysym_get_name(sym, label, 64) < 0) strcpy(label, "?");
+}
+
+static const struct {
+	xkb_keysym_t key;
+	const char *action;
+} shortcuts[] = {
+	{KEY_LEFT, "Move left"}, {KEY_DOWN, "Move down"}, {KEY_UP, "Move up"}, {KEY_RIGHT, "Move right"},
+	{KEY_FIRST, "First game"}, {KEY_LAST, "Last game"}, {KEY_LAUNCH, "Play game"},
+	{KEY_SEARCH, "Search titles"}, {KEY_NEXT_MATCH, "Next match"}, {KEY_PREV_MATCH, "Previous match"},
+	{KEY_ADD, "Add config"}, {KEY_EDIT, "Edit config"}, {KEY_RENAME, "Rename config"},
+	{KEY_REMOVE, "Trash config"}, {KEY_REFRESH, "Rescan library"}, {KEY_LOG, "Open launch log"},
+	{KEY_HELP, "Show shortcuts"}, {KEY_QUIT, "Quit"}
+};
+
+static int help_rows(void)
+{
+	int rows = (main_view.height - Header - Footer - 8) / (STATUS_FONT_SIZE + 6);
+	return rows > 0 ? rows : 1;
+}
+
+static int help_pages(void)
+{
+	int total = sizeof shortcuts / sizeof shortcuts[0];
+	return (total + help_rows() - 1) / help_rows();
+}
+
+static void paint_help(struct canvas c)
+{
+	char label[64], binding[136];
+	int rows = help_rows(), key_width = 0;
+	if (help_page > help_pages()) help_page = help_pages();
+	int first = (help_page - 1) * rows;
+	fill(c, 0, 0, c.width, c.height, BACKGROUND);
+	fill(c, 0, 0, c.width, Header, BAR_BACKGROUND);
+	text(c, 8, HEADER_FONT_SIZE + 6, 0, c.width, HEADER_FONT_SIZE, TEXT_COLOR, "Shortcuts");
+	for (int i = 0; i < (int)(sizeof shortcuts / sizeof shortcuts[0]); ++i) {
+		key_label(shortcuts[i].key, label);
+		if (shortcuts[i].key == KEY_FIRST)
+			snprintf(binding, sizeof binding, "%s%s%s", label, strlen(label) > 1 ? " " : "", label);
+		else strcpy(binding, label);
+		int width = text_width(STATUS_FONT_SIZE, binding);
+		if (width > key_width) key_width = width;
+		if (i < first || i - first >= rows) continue;
+		int y = Header + 4 + STATUS_FONT_SIZE + (i - first) * (STATUS_FONT_SIZE + 6);
+		text(c, 8, y, 0, c.width, STATUS_FONT_SIZE, TEXT_COLOR, binding);
+	}
+	int x = 8 + key_width + 16;
+	for (int i = first; i < (int)(sizeof shortcuts / sizeof shortcuts[0]) && i - first < rows; ++i) {
+		int y = Header + 4 + STATUS_FONT_SIZE + (i - first) * (STATUS_FONT_SIZE + 6);
+		text(c, x, y, x, c.width, STATUS_FONT_SIZE, TEXT_COLOR, shortcuts[i].action);
+	}
+	int bar = c.height - Footer;
+	fill(c, 0, bar, c.width, Footer, BAR_BACKGROUND);
+	const char *hint = help_pages() > 1 ? "Esc close   Space next page" : "Esc close";
+	text(c, 6, bar + STATUS_FONT_SIZE + 1, 0, c.width, STATUS_FONT_SIZE, TEXT_COLOR, hint);
+}
+
 static void paint(struct canvas c)
 {
+	if (help_page) { paint_help(c); return; }
 	int i, y, cols = columns(), width = c.width, height = c.height;
 	int rows = (height - Header - Footer - SPACING) / (TileHeight + SPACING);
 	int bar = height > Footer ? height - Footer : 0;
@@ -112,7 +182,13 @@ static void paint(struct canvas c)
 	if (first_row <= selected / cols - rows) first_row = selected / cols - rows + 1;
 	fill(c, 0, 0, width, height, BACKGROUND);
 	fill(c, 0, 0, width, Header, BAR_BACKGROUND);
-	text(c, SPACING, HEADER_FONT_SIZE + 6, 0, width, HEADER_FONT_SIZE, 0xffffff, "ludus");
+	text(c, SPACING, HEADER_FONT_SIZE + 6, 0, width, HEADER_FONT_SIZE, TEXT_COLOR, "ludus");
+	char help_key[64], hint[72];
+	key_label(KEY_HELP, help_key);
+	snprintf(hint, sizeof hint, "%s Help", help_key);
+	int hint_x = right - text_width(STATUS_FONT_SIZE, hint);
+	if (prompt_mode == NoPrompt && hint_x > SPACING + text_width(HEADER_FONT_SIZE, "ludus") + 8)
+		text(c, hint_x, (Header + STATUS_FONT_SIZE) / 2, 0, right, STATUS_FONT_SIZE, TEXT_COLOR, hint);
 	static int cached_begin, cached_end;
 	int begin = first_row * cols;
 	int end = begin;
@@ -125,12 +201,12 @@ static void paint(struct canvas c)
 		if (visible <= 0) continue;
 		if (visible > COVER_WIDTH) visible = COVER_WIDTH;
 		if (i == selected)
-			fill(c, left - 2, top - 2, COVER_WIDTH + 4, CoverHeight + 4, BORDER_COLOR);
+			fill(c, left - 2, top - 2, COVER_WIDTH + 4, CoverHeight + 4, ACCENT_COLOR);
 		if (!games[i].tried) load_cover(&games[i]);
-		wrapped_title(c, left, top + CoverHeight + 6 + FONT_SIZE, COVER_WIDTH, FONT_SIZE,
-		              TitleLines, 0xffffff, games[i].name);
+		wrapped_title(c, left, top + CoverHeight + 6 + TITLE_FONT_SIZE, COVER_WIDTH, TITLE_FONT_SIZE,
+		              TitleLines, TEXT_COLOR, games[i].name);
 		if (!games[i].thumbnail) {
-			fill(c, left, top, COVER_WIDTH, CoverHeight, 0x38393b);
+			fill(c, left, top, COVER_WIDTH, CoverHeight, EMPTY_COVER_COLOR);
 			continue;
 		}
 		for (y = 0; y < CoverHeight && top + y < bar; ++y)
@@ -146,10 +222,14 @@ static void paint(struct canvas c)
 	cached_begin = begin;
 	cached_end = end;
 	fill(c, 0, bar, width, Footer, BAR_BACKGROUND);
+	if (prompt_mode == RepairPrompt) {
+		text(c, 6, bar + STATUS_FONT_SIZE + 1, 6, right, STATUS_FONT_SIZE, TEXT_COLOR, repair_message);
+		return;
+	}
 	if (prompt_mode == RemovePrompt) {
 		char confirm[PATH_MAX + 32];
 		snprintf(confirm, sizeof confirm, "Enter to remove %s", games[selected].name);
-		text(c, 6, bar + STATUS_FONT_SIZE + 1, 6, right, STATUS_FONT_SIZE, 0xffffff, confirm);
+		text(c, 6, bar + STATUS_FONT_SIZE + 1, 6, right, STATUS_FONT_SIZE, TEXT_COLOR, confirm);
 		return;
 	}
 	if (prompt_mode != NoPrompt) {
@@ -168,15 +248,15 @@ static void paint(struct canvas c)
 		int caret = text_width(STATUS_FONT_SIZE, prompt);
 		prompt[caret_pos] = saved;
 		int start = caret + 8 < edge ? 6 : edge - caret - 2;
-		text(c, start, bar + STATUS_FONT_SIZE + 1, 6, edge, STATUS_FONT_SIZE, 0xffffff, prompt);
-		fill(c, start + caret, bar + 3, 1, STATUS_FONT_SIZE, BORDER_COLOR);
-		if (*message) text(c, edge + 4, bar + STATUS_FONT_SIZE + 1, edge + 4, right, STATUS_FONT_SIZE, 0xffffff, message);
+		text(c, start, bar + STATUS_FONT_SIZE + 1, 6, edge, STATUS_FONT_SIZE, TEXT_COLOR, prompt);
+		fill(c, start + caret, bar + 3, 1, STATUS_FONT_SIZE, ACCENT_COLOR);
+		if (*message) text(c, edge + 4, bar + STATUS_FONT_SIZE + 1, edge + 4, right, STATUS_FONT_SIZE, TEXT_COLOR, message);
 		return;
 	}
-	text(c, 6, bar + STATUS_FONT_SIZE + 1, 0, split - 4, STATUS_FONT_SIZE, 0xffffff,
+	text(c, 6, bar + STATUS_FONT_SIZE + 1, 0, split - 4, STATUS_FONT_SIZE, TEXT_COLOR,
 	     count ? games[selected].name : "Press + to add a game");
 	if (*status)
-		text(c, status_x, bar + STATUS_FONT_SIZE + 1, split, right, STATUS_FONT_SIZE, 0xffffff, status);
+		text(c, status_x, bar + STATUS_FONT_SIZE + 1, split, right, STATUS_FONT_SIZE, TEXT_COLOR, status);
 
 }
 
@@ -353,13 +433,16 @@ static int spawn_terminal(char *command, const char *path)
 	return posix_spawnp(&editor_pid, args[0], NULL, NULL, args, environ);
 }
 
-static void start_editor(const char *path, const char *name)
+static void start_editor(enum editor_action action, const char *target)
 {
 	if (editor_pid) return;
 	main_view.dirty = 1;
 	const char *editor = getenv("EDITOR");
-	char *message = name ? prompt_error : status;
-	size_t capacity = name ? sizeof prompt_error : sizeof status;
+	const char *path = target;
+	char *message = status;
+	size_t capacity = sizeof status;
+	if (action == AddConfig) { message = prompt_error; capacity = sizeof prompt_error; }
+	if (prompt_mode == RepairPrompt) { message = repair_message; capacity = sizeof repair_message; }
 	char command[PATH_MAX];
 	if (!editor || !*editor) {
 		strcpy(message, "Set EDITOR to edit game configs");
@@ -370,15 +453,21 @@ static void start_editor(const char *path, const char *name)
 		strcpy(message, "EDITOR command is too long");
 		return;
 	}
-	if (name) {
-		if (library_draft(name, editor_draft, &draft_revision)) {
+	if (action == AddConfig) {
+		if (library_draft(target, editor_config, &draft_revision)) {
 			if (errno == EEXIST) strcpy(message, "A config with that name exists");
 			else if (errno == EINVAL) strcpy(message, "Enter a valid filename");
 			else snprintf(message, capacity, "Cannot create config: %s", strerror(errno));
-			editor_draft[0] = 0;
 			return;
 		}
-		path = editor_draft;
+		path = editor_config;
+	} else if (action == EditConfig) {
+		const char *missing;
+		if (library_inspect(path, &missing, &previous_hash)) {
+			snprintf(message, capacity, "Cannot read config: %s", strerror(errno));
+			return;
+		}
+		if (target != editor_config) snprintf(editor_config, sizeof editor_config, "%s", target);
 	}
 	stop_repeat();
 	clipboard_cancel();
@@ -395,8 +484,7 @@ static void start_editor(const char *path, const char *name)
 	int error = tty >= 0 ? spawn_tty_editor(tty, args) : spawn_terminal(command, path);
 	if (error) {
 		if (tty >= 0) close(tty);
-		if (*editor_draft) library_discard_draft(editor_draft, &draft_revision);
-		editor_draft[0] = 0;
+		if (action == AddConfig) library_discard_draft(editor_config, &draft_revision);
 		editor_pid = 0;
 		if (tty < 0 && error == ENOENT)
 			strcpy(message, "Set TERMINAL or install xdg-terminal-exec");
@@ -406,6 +494,7 @@ static void start_editor(const char *path, const char *name)
 		show_view();
 		return;
 	}
+	editor_action = action;
 	editor_tty = tty;
 	prompt_mode = NoPrompt;
 	status[0] = 0;
@@ -448,7 +537,7 @@ static void prompt_key(xkb_keysym_t sym, uint32_t code)
 		if (!search && !cancel) {
 			if (prompt_mode == RemovePrompt) remove_selected();
 			else if (prompt_mode == RenamePrompt) rename_selected();
-			else if (*game_name) start_editor(NULL, game_name);
+			else if (*game_name) start_editor(AddConfig, game_name);
 			else strcpy(prompt_error, "Enter a game name");
 			return;
 		}
@@ -472,13 +561,33 @@ static void editor_finished(int result)
 		editor_tty = -1;
 		restore_editor_signals(sizeof editor_signals / sizeof *editor_signals);
 	}
-	if (*editor_draft) library_discard_draft(editor_draft, &draft_revision);
-	selected = library_load(selected, editor_draft);
-	editor_draft[0] = 0;
+	int discarded = editor_action == AddConfig && library_discard_draft(editor_config, &draft_revision);
+	selected = library_load(selected, editor_action == ViewLog ? NULL : editor_config);
 	if (WIFSIGNALED(result))
 		snprintf(status, sizeof status, "Editor stopped (signal %d)", WTERMSIG(result));
 	else if (WIFEXITED(result) && WEXITSTATUS(result))
 		snprintf(status, sizeof status, "Editor exited (%d)", WEXITSTATUS(result));
+	if (editor_action != ViewLog) {
+		const char *name = strrchr(editor_config, '/') + 1;
+		const char *missing;
+		uint64_t hash;
+		int success = WIFEXITED(result) && !WEXITSTATUS(result);
+		if (discarded) {
+			if (success) strcpy(status, "No changes");
+		} else if (library_inspect(editor_config, &missing, &hash)) {
+			if (success) snprintf(status, sizeof status, "Cannot read %s: %s", name, strerror(errno));
+		} else if (missing) {
+			char key[64] = {0};
+			xkb_keysym_get_name(KEY_EDIT, key, sizeof key);
+			snprintf(repair_message, sizeof repair_message, "Missing %s=. %s to reopen, Esc to dismiss. %s",
+			         missing, key, name);
+			prompt_mode = RepairPrompt;
+		} else if (success) {
+			if (editor_action == AddConfig) snprintf(status, sizeof status, "Added %s", name);
+			else if (hash != previous_hash) snprintf(status, sizeof status, "Updated %s", name);
+			else strcpy(status, "No changes");
+		}
+	}
 	show_view();
 }
 
@@ -511,6 +620,13 @@ static void reap(void)
 static void press(xkb_keysym_t sym)
 {
 	int col = columns(), old = selected;
+	if (sym == KEY_FIRST && count) {
+		if (first_key_pending) { selected = 0; main_view.dirty = 1; }
+		first_key_pending = !first_key_pending;
+		return;
+	}
+	first_key_pending = 0;
+	if (sym == KEY_HELP) { help_page = 1; main_view.dirty = 1; return; }
 	if (sym == KEY_QUIT) running = 0;
 	if (sym == KEY_REFRESH) {
 		selected = library_load(selected, NULL);
@@ -548,7 +664,7 @@ static void press(xkb_keysym_t sym)
 		return;
 	}
 	if (sym == KEY_LOG) {
-		if (games[selected].log) start_editor(games[selected].log, NULL);
+		if (games[selected].log) start_editor(ViewLog, games[selected].log);
 		else { strcpy(status, "No launch log for this game"); main_view.dirty = 1; }
 		return;
 	}
@@ -558,7 +674,8 @@ static void press(xkb_keysym_t sym)
 		main_view.dirty = 1;
 		return;
 	}
-	if (sym == KEY_EDIT) { start_editor(games[selected].path, NULL); return; }
+	if (sym == KEY_EDIT) { start_editor(EditConfig, games[selected].path); return; }
+	if (sym == KEY_LAST) selected = count - 1;
 	if (sym == KEY_LEFT && selected % col > 0) --selected;
 	if (sym == KEY_RIGHT && selected % col < col - 1 && selected + 1 < count) ++selected;
 	if (sym == KEY_UP && selected >= col) selected -= col;
@@ -618,6 +735,18 @@ static int handle_press(uint32_t code)
 {
 	xkb_keysym_t sym = xkb_state_key_get_one_sym(keys, code);
 	if (!main_view.surface || focus != main_view.surface) return 0;
+	if (help_page) {
+		if (sym == KEY_HELP || sym == XKB_KEY_Escape) help_page = 0;
+		else if (sym == XKB_KEY_space) help_page = help_page % help_pages() + 1;
+		else return 0;
+		main_view.dirty = 1;
+		return 0;
+	}
+	if (prompt_mode == RepairPrompt) {
+		if (sym == KEY_EDIT) start_editor(EditConfig, editor_config);
+		else if (sym == XKB_KEY_Escape) { prompt_mode = NoPrompt; main_view.dirty = 1; }
+		return 0;
+	}
 	if (prompt_mode == RemovePrompt) {
 		if (sym == XKB_KEY_Escape || sym == XKB_KEY_Return || sym == XKB_KEY_KP_Enter)
 			prompt_key(sym, code);
@@ -676,7 +805,7 @@ static void repeat_info(void *data, struct wl_keyboard *kb, int32_t rate, int32_
 static void enter(void *d, struct wl_keyboard *k, uint32_t s, struct wl_surface *w, struct wl_array *a)
 { (void)d; (void)k; (void)s; stop_repeat(); focus = w; (void)a; }
 static void leave(void *d, struct wl_keyboard *k, uint32_t s, struct wl_surface *w)
-{ (void)d; (void)k; (void)s; stop_repeat(); if (focus == w) focus = NULL; }
+{ (void)d; (void)k; (void)s; stop_repeat(); if (focus == w) { focus = NULL; first_key_pending = 0; } }
 static const struct wl_keyboard_listener keyboard_events = {
 	.keymap = keymap, .enter = enter, .leave = leave, .key = key, .modifiers = modifiers, .repeat_info = repeat_info
 };

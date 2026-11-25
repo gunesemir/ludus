@@ -69,27 +69,44 @@ static FILE *open_config(const char *path, struct stat *revision)
 }
 
 /* Recognize an oyna file by its required keys. Track only the artwork value. */
-static int read_oyna(FILE *f, char **art)
+static int read_oyna(FILE *f, char **art, const char **missing, uint64_t *hash)
 {
 	char *line = NULL;
 	size_t cap = 0;
 	ssize_t n;
 	int valid_text = 1;
+	if (hash) *hash = UINT64_C(14695981039346656037);
 	int exe = 0, prefix = 0, proton = 0;
 	while ((n = getline(&line, &cap, f)) >= 0) {
 		if (memchr(line, 0, n)) { valid_text = 0; break; }
+		if (hash) {
+			for (ssize_t i = 0; i < n; ++i)
+				*hash = (*hash ^ (unsigned char)line[i]) * UINT64_C(1099511628211);
+		}
 		if (n && line[n-1] == '\n') line[--n] = 0;
 		if (n && line[n-1] == '\r') line[--n] = 0;
 		if (!strncmp(line, "exe=", 4)) exe = line[4] != 0;
 		else if (!strncmp(line, "WINEPREFIX=", 11)) prefix = line[11] != 0;
 		else if (!strncmp(line, "PROTONPATH=", 11)) proton = line[11] != 0;
-		else if (!strncmp(line, "art=", 4)) {
+		else if (art && !strncmp(line, "art=", 4)) {
 			free(*art);
 			*art = copy(line + 4);
 		}
 	}
 	free(line);
-	return valid_text && exe && prefix && proton && feof(f);
+	*missing = !exe ? "exe" : !prefix ? "WINEPREFIX" : !proton ? "PROTONPATH" : NULL;
+	return valid_text && feof(f) && !ferror(f);
+}
+
+int library_inspect(const char *path, const char **missing, uint64_t *hash)
+{
+	struct stat st;
+	FILE *f = open_config(path, &st);
+	if (!f) return -1;
+	int ok = read_oyna(f, NULL, missing, hash);
+	fclose(f);
+	if (!ok) { errno = EINVAL; return -1; }
+	return 0;
 }
 
 /* Both snapshots refer to the descriptor from which we parsed the entry. */
@@ -100,7 +117,8 @@ static char *load_art(const char *path, struct stat *revision)
 	if (!f) return NULL;
 	char *art = NULL;
 	int error = 0;
-	if (!read_oyna(f, &art)) error = EINVAL;
+	const char *missing;
+	if (!read_oyna(f, &art, &missing, NULL) || missing) error = EINVAL;
 	else if (fstat(fileno(f), &after)) error = errno;
 	else if (!same_revision(revision, &after)) error = ESTALE;
 	fclose(f);
@@ -194,13 +212,13 @@ int library_draft(const char *name, char *path, struct stat *revision)
 	const char template[] =
 		"exe=\n"
 		"art=\n"
-		"WINEPREFIX=\n"
-		"PROTONPATH=\n\n"
+		"WINEPREFIX=~/.oyna/prefix/%s\n"
+		"PROTONPATH=~/.oyna/proton/GE-Proton\n\n"
 		"# Optional\n"
 		"#GAMEID=\n"
 		"#STORE=\n"
 		"#arg=\n";
-	if (!valid_name(name) || !name[strspn(name, " ")]) { errno = EINVAL; return -1; }
+	if (!valid_name(name) || strpbrk(name, "\r\n") || !name[strspn(name, " ")]) { errno = EINVAL; return -1; }
 	if (!*dir) { errno = ENOENT; return -1; }
 	if (join(path, dir, name)) return -1;
 	if (mkdir(dir, 0700) && errno != EEXIST) return -1;
@@ -211,17 +229,17 @@ int library_draft(const char *name, char *path, struct stat *revision)
 	int error = 0;
 	if (!f) { error = errno; close(fd); }
 	else {
-		if (fputs(template, f) == EOF || fflush(f) || fstat(fd, revision)) error = errno;
+		if (fprintf(f, template, name) < 0 || fflush(f) || fstat(fd, revision)) error = errno;
 		if (fclose(f) && !error) error = errno;
 	}
 	if (error) { unlink(path); errno = error; return -1; }
 	return 0;
 }
 
-void library_discard_draft(const char *path, const struct stat *revision)
+int library_discard_draft(const char *path, const struct stat *revision)
 {
 	struct stat current;
-	if (!lstat(path, &current) && same_revision(revision, &current)) unlink(path);
+	return !lstat(path, &current) && same_revision(revision, &current) && !unlink(path);
 }
 
 static int check_config(const struct game *g)

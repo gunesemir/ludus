@@ -68,7 +68,7 @@ static FILE *open_config(const char *path, struct stat *revision)
 	return NULL;
 }
 
-/* Recognize an oyna file by its required keys. Track only the artwork value. */
+/* Oyna requires exe=. It handles the remaining launch settings. */
 static int read_oyna(FILE *f, char **art, const char **missing, uint64_t *hash)
 {
 	char *line = NULL;
@@ -76,7 +76,7 @@ static int read_oyna(FILE *f, char **art, const char **missing, uint64_t *hash)
 	ssize_t n;
 	int valid_text = 1;
 	if (hash) *hash = UINT64_C(14695981039346656037);
-	int exe = 0, prefix = 0, proton = 0;
+	int exe = 0;
 	while ((n = getline(&line, &cap, f)) >= 0) {
 		if (memchr(line, 0, n)) { valid_text = 0; break; }
 		if (hash) {
@@ -86,15 +86,13 @@ static int read_oyna(FILE *f, char **art, const char **missing, uint64_t *hash)
 		if (n && line[n-1] == '\n') line[--n] = 0;
 		if (n && line[n-1] == '\r') line[--n] = 0;
 		if (!strncmp(line, "exe=", 4)) exe = line[4] != 0;
-		else if (!strncmp(line, "WINEPREFIX=", 11)) prefix = line[11] != 0;
-		else if (!strncmp(line, "PROTONPATH=", 11)) proton = line[11] != 0;
 		else if (art && !strncmp(line, "art=", 4)) {
 			free(*art);
 			*art = copy(line + 4);
 		}
 	}
 	free(line);
-	*missing = !exe ? "exe" : !prefix ? "WINEPREFIX" : !proton ? "PROTONPATH" : NULL;
+	*missing = exe ? NULL : "exe";
 	return valid_text && feof(f) && !ferror(f);
 }
 

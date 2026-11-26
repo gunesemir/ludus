@@ -35,6 +35,17 @@ arg=-novid
 in `~/.cache/ludus/`. Oyna handles launch settings and game arguments.
 See the [oyna config documentation][oyna-config].
 
+### Native Linux games
+
+Use a version of oyna with native Linux support. For example
+
+```ini
+exe=/games/My Game/start.sh
+arg=OYNA_NO_PROTON=1 %command%
+```
+
+You can leave `WINEPREFIX=` and `PROTONPATH=` blank or remove those lines.
+
 ## Keys
 
 | Key | Action |

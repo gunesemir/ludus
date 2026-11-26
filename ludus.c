@@ -183,12 +183,6 @@ static void paint(struct canvas c)
 	fill(c, 0, 0, width, height, BACKGROUND);
 	fill(c, 0, 0, width, Header, BAR_BACKGROUND);
 	text(c, SPACING, HEADER_FONT_SIZE + 6, 0, width, HEADER_FONT_SIZE, TEXT_COLOR, "ludus");
-	char help_key[64], hint[72];
-	key_label(KEY_HELP, help_key);
-	snprintf(hint, sizeof hint, "%s Help", help_key);
-	int hint_x = right - text_width(STATUS_FONT_SIZE, hint);
-	if (prompt_mode == NoPrompt && hint_x > SPACING + text_width(HEADER_FONT_SIZE, "ludus") + 8)
-		text(c, hint_x, (Header + STATUS_FONT_SIZE) / 2, 0, right, STATUS_FONT_SIZE, TEXT_COLOR, hint);
 	static int cached_begin, cached_end;
 	int begin = first_row * cols;
 	int end = begin;
